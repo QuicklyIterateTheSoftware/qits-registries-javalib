@@ -35,14 +35,14 @@ public class CiScreenshotsProfile implements RepositoryTypeProfile {
   @Override
   public Set<String> requiredMetadataKeys() {
     return Set.of(
-        "git.branch.name",
-        "git.commit.hash",
-        "qits.userflow.name",
+        MetadataKeys.GIT_BRANCH_NAME,
+        MetadataKeys.GIT_COMMIT_HASH,
+        MetadataKeys.USERFLOW_NAME,
         "qits.userflow.hash",
         "qits.display.name",
         "qits.diff.hash",
-        "media.resolution.width",
-        "media.resolution.height");
+        MetadataKeys.RESOLUTION_WIDTH,
+        MetadataKeys.RESOLUTION_HEIGHT);
   }
 
   @Override

@@ -18,6 +18,12 @@ public final class MetadataKeys {
   /** Half of the golden pairing key: which branch the artifact was produced from. */
   public static final String GIT_BRANCH_NAME = "git.branch.name";
 
+  /** The commit the artifact was produced from. */
+  public static final String GIT_COMMIT_HASH = "git.commit.hash";
+
+  /** The repository the artifact was produced from (e.g. {@code qits-githost}). */
+  public static final String GIT_REPOSITORY_NAME = "git.repository.name";
+
   /** Half of the golden pairing key: which logical user flow was recorded. */
   public static final String USERFLOW_NAME = "qits.userflow.name";
 
