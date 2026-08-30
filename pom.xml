@@ -30,7 +30,7 @@
          consumer has to move with it in the same campaign — so the branch must be invisible to the
          calver train and to a ship-mains bootstrap until they are all ready. A -SNAPSHOT the
          consumer branches pin exactly is what keeps it that way; the release restamps calver. -->
-    <version>2026.827.71232</version>
+    <version>2026.830.132821</version>
     <packaging>jar</packaging>
     <name>qits-blobstore</name>
 
