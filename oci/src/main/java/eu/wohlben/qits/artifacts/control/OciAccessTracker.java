@@ -2,6 +2,7 @@ package eu.wohlben.qits.artifacts.control;
 
 import eu.wohlben.qits.artifacts.persistence.OciManifestRepository;
 import eu.wohlben.qits.artifacts.persistence.OciTagRepository;
+import eu.wohlben.qits.blobstore.control.ArtifactAccessTracker;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.transaction.Transactional;

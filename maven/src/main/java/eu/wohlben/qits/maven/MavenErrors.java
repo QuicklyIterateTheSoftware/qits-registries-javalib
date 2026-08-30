@@ -1,9 +1,9 @@
 package eu.wohlben.qits.maven;
 
-import eu.wohlben.qits.artifacts.error.ArtifactsException;
+import eu.wohlben.qits.blobstore.error.ArtifactsException;
 import eu.wohlben.qits.artifacts.error.MavenException;
-import eu.wohlben.qits.artifacts.error.NotFoundException;
-import eu.wohlben.qits.artifacts.error.PayloadTooLargeException;
+import eu.wohlben.qits.blobstore.error.NotFoundException;
+import eu.wohlben.qits.blobstore.error.PayloadTooLargeException;
 import io.vertx.core.http.HttpHeaders;
 import io.vertx.ext.web.RoutingContext;
 import org.jboss.logging.Logger;

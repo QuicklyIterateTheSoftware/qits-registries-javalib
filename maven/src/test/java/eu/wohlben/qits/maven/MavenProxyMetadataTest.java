@@ -1,6 +1,6 @@
 package eu.wohlben.qits.maven;
 
-import eu.wohlben.qits.artifacts.control.ArtifactRepositoryService;
+import eu.wohlben.qits.blobstore.control.ArtifactRepositoryService;
 import eu.wohlben.qits.artifacts.control.MavenProxyProfile;
 import jakarta.inject.Inject;
 import static org.junit.jupiter.api.Assertions.assertEquals;

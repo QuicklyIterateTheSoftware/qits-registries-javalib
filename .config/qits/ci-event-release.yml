@@ -11,6 +11,10 @@ when:
   # was addressed with; a rename updates this line in the same campaign.
   - repoName: { exact: qits-registries-javalib }
 artifacts:
+  # The store merged in on 2026-08-30 and rides this release. Its coordinate keeps the shape it
+  # always had — `qits-blobstore`, not `qits-registries-blobstore` — because consumers pin it and
+  # a maven coordinate is a platform-wide contract.
+  - { type: maven, name: "eu.wohlben.qits:qits-blobstore" }
   - { type: maven, name: "eu.wohlben.qits:qits-registries-common" }
   - { type: maven, name: "eu.wohlben.qits:qits-registries-npm" }
   - { type: maven, name: "eu.wohlben.qits:qits-registries-maven" }
@@ -21,7 +25,7 @@ steps:
     script: |
       set -eu
       # THE TAG NAME IS THE VERSION. Nothing upstream vets it now that any tag push reaches here,
-      # and it becomes a registry coordinate for four modules, so the shape is checked before
+      # and it becomes a registry coordinate for five modules, so the shape is checked before
       # anything is fetched or deployed: a CalVer is digits and dots.
       version=$(printf '%s' "$QITS_EVENT_PAYLOAD" | jq -er .tagName)
       case "$version" in
@@ -30,10 +34,11 @@ steps:
       git fetch "$QITS_CI_REPOSITORY_URL" "refs/tags/$version:refs/tags/$version"
       git checkout --detach "$version"
       # Skip only when EVERY module of this reactor is published: `deploy` runs at the root and
-      # ships them together, so one missing module means the whole run must go again.
+      # ships them together, so one missing module means the whole run must go again. Named by
+      # artifactId, not by directory: the merged store publishes as qits-blobstore.
       published=1
-      for module in common npm maven oci; do
-        artifact="qits-registries-$module"
+      for artifact in qits-blobstore qits-registries-common qits-registries-npm \
+                      qits-registries-maven qits-registries-oci; do
         curl -fsS -o /dev/null \
           "$QITS_MAVEN_REGISTRY_URL/eu/wohlben/qits/$artifact/$version/$artifact-$version.pom" \
           || published=0
@@ -42,10 +47,11 @@ steps:
         echo "every module @$version is already published — skipping"
         exit 0
       fi
-      # qits-blobstore and qits-db-core resolve from the platform registry. The pom's default names
-      # localhost:8081 (unreachable inside a step container), and the derived non-localhost address
-      # then needs the exact-id mirror in .qits-maven-settings.xml to get past Maven's HTTP blocker
-      # — the same pair every service's image build uses.
+      # qits-db-core resolves from the platform registry — the one dependency left outside this
+      # reactor since the blobstore merge. The pom's default names localhost:8081 (unreachable
+      # inside a step container), and the derived non-localhost address then needs the exact-id
+      # mirror in .qits-maven-settings.xml to get past Maven's HTTP blocker — the same pair every
+      # service's image build uses.
       export QITS_MAVEN_REPOSITORY_URL="$QITS_MAVEN_REGISTRY_URL"
       # This script is read from main's head, but the checkout above is the release TAG — which may
       # predate a file the script names. Guard on presence: a tree old enough to lack the mirror

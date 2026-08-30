@@ -1,6 +1,6 @@
 package eu.wohlben.qits.maven;
 
-import eu.wohlben.qits.artifacts.control.BlobStore;
+import eu.wohlben.qits.blobstore.control.BlobStore;
 import eu.wohlben.qits.artifacts.control.MavenRegistryService;
 import eu.wohlben.qits.artifacts.error.MavenException;
 import io.quarkus.runtime.configuration.MemorySize;

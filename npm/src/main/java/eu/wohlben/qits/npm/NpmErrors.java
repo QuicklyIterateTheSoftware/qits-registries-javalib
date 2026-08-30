@@ -1,9 +1,9 @@
 package eu.wohlben.qits.npm;
 
-import eu.wohlben.qits.artifacts.error.ArtifactsException;
-import eu.wohlben.qits.artifacts.error.NotFoundException;
+import eu.wohlben.qits.blobstore.error.ArtifactsException;
+import eu.wohlben.qits.blobstore.error.NotFoundException;
 import eu.wohlben.qits.artifacts.error.NpmException;
-import eu.wohlben.qits.artifacts.error.PayloadTooLargeException;
+import eu.wohlben.qits.blobstore.error.PayloadTooLargeException;
 import io.vertx.core.http.HttpHeaders;
 import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.RoutingContext;

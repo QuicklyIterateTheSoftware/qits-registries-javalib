@@ -2,6 +2,8 @@ package eu.wohlben.qits.artifacts.control;
 
 import eu.wohlben.qits.artifacts.entity.OciManifest;
 import eu.wohlben.qits.artifacts.entity.OciTag;
+import eu.wohlben.qits.blobstore.control.ArtifactRepositoryService;
+import eu.wohlben.qits.blobstore.control.BlobStore;
 import io.quarkus.narayana.jta.QuarkusTransaction;
 import jakarta.inject.Inject;
 import java.io.ByteArrayInputStream;

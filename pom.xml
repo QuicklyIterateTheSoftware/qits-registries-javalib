@@ -4,9 +4,15 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <!-- The package-format code extracted from qits-platform-artifacts (phase 1 of
-         byte-plane-split-plan.md): the protocol services, the wire routes and the upstream clients
-         for npm, maven and OCI, over the content-addressed store in qits-blobstore.
+    <!-- The platform's byte plane, whole: the content-addressed blob store, and the protocol
+         services, wire routes and upstream clients for npm, maven and OCI that write through it.
+
+         Both halves came out of qits-platform-artifacts (phase 1 of byte-plane-split-plan.md), the
+         store into its own repository and the formats into this one. That split was awkward — it
+         left the store's classes in `eu.wohlben.qits.artifacts` — and it is undone: qits-blobstore
+         merged in here on 2026-08-30 with its history, its package renamed to
+         `eu.wohlben.qits.blobstore`, its maven coordinate unchanged. One repository, one release,
+         one version for the storage layer.
 
          ONE MODULE PER FORMAT, and each carries BOTH sides — hosted and pull-through cache. A
          consuming service wires only the repository types it owns: qits-platform-mirror takes the
@@ -18,27 +24,27 @@
          NO FLYWAY MIGRATIONS: each consuming service owns its schema. JPA entities travel as they
          are, and the suites generate their schema from the mappings.
 
-         Package names are UNCHANGED — eu.wohlben.qits.artifacts.* for the store-side halves and
-         eu.wohlben.qits.{npm,maven,registry} for the routes — so the later service-side switch is a
-         dependency change rather than a rewrite.
+         The FORMAT modules keep their package names — eu.wohlben.qits.artifacts.* for the
+         store-side halves and eu.wohlben.qits.{npm,maven,registry} for the routes — so the
+         service-side switch stays a dependency change rather than a rewrite. Only the merged
+         blobstore module moved, to eu.wohlben.qits.blobstore.*.
 
-         Resolves from Maven Central except for two platform artifacts: qits-blobstore, the store
-         these formats write through, and qits-db-core, which carries DbRetry. Both come from the
-         `qits-maven` repository below. -->
+         Resolves from Maven Central except for one platform artifact: qits-db-core, which carries
+         DbRetry. It comes from the `qits-maven` repository below. -->
     <groupId>eu.wohlben.qits</groupId>
     <artifactId>qits-registries</artifactId>
-    <!-- BRANCH VERSION. `postgres-blobs` follows qits-blobstore onto PostgreSQL-only blobs, which
-         changes that jar's API — so this reactor and its consumers move in the same campaign and
-         must stay invisible to the calver train and to a ship-mains bootstrap until they are all
-         ready. A -SNAPSHOT the consumer branches pin exactly is what keeps it that way; the release
-         restamps calver. -->
+    <!-- One version for the whole byte plane. Every module carries it verbatim — this repository
+         duplicates the version rather than deriving it, so the release stamp rewrites one literal
+         per pom — and `deploy` at the root publishes them together. -->
     <version>2026.830.132953</version>
     <packaging>pom</packaging>
     <name>qits-registries</name>
 
     <modules>
-        <!-- `common` first: it holds what two formats need and neither owns. The three format
-             modules are siblings and depend on each other not at all. -->
+        <!-- `blobstore` first: the store every other module writes through. Then `common`, which
+             holds what two formats need and neither owns. The three format modules are siblings and
+             depend on each other not at all. -->
+        <module>blobstore</module>
         <module>common</module>
         <module>npm</module>
         <module>maven</module>
@@ -46,8 +52,6 @@
     </modules>
 
     <properties>
-        <!-- The store, pinned at its released calver. -->
-        <qits.blobstore.version>2026.818.45340</qits.blobstore.version>
         <!-- DbRetry, the read patience seam. Published by libs/qits-integrations-quarkus, so it is
              pinned to a released calver rather than following a snapshot. -->
         <qits.db-core.version>2026.817.175344</qits.db-core.version>
@@ -60,11 +64,11 @@
         <quarkus.platform.group-id>io.quarkus.platform</quarkus.platform.group-id>
         <quarkus.platform.version>3.34.6</quarkus.platform.version>
 
-        <!-- Real postgres for the format suites: the blob store's only backend is postgres now, so
-             every suite that stores a byte needs one. Zonky resolves the binaries as ordinary Maven
-             artifacts and runs them as a child process, which keeps the rule that a clone builds and
-             tests green with no docker. 18.4.0 matches the platform's own qits-oci-postgresql image
-             and the version qits-blobstore's own suite runs on. -->
+        <!-- Real postgres for the store's suite and the format suites alike: the blob store's only
+             backend is postgres now, so every suite that stores a byte needs one. Zonky resolves the
+             binaries as ordinary Maven artifacts and runs them as a child process, which keeps the
+             rule that a clone builds and tests green with no docker. 18.4.0 matches the platform's
+             own database image. -->
         <zonky.embedded-postgres.version>2.2.2</zonky.embedded-postgres.version>
         <zonky.postgres-binaries.version>18.4.0</zonky.postgres-binaries.version>
 
@@ -77,11 +81,10 @@
     </properties>
 
     <repositories>
-        <!-- The platform's own Maven repository, for qits-blobstore and qits-db-core — the two
-             dependencies neither on Maven Central nor in this reactor. A local build resolves them
-             from ~/.m2 instead;
-             a publish container has no such cache and reads it from the store it was just
-             deployed to. The id must stay `qits-maven`: it is what a cached copy is
+        <!-- The platform's own Maven repository, for qits-db-core — since the blobstore merge the
+             one dependency neither on Maven Central nor in this reactor. A local build resolves it
+             from ~/.m2 instead; a publish container has no such cache and reads it from the store it
+             was just deployed to. The id must stay `qits-maven`: it is what a cached copy is
              recorded under, and what the bootstrap's settings mirror matches by exact id. -->
         <repository>
             <id>qits-maven</id>
@@ -125,9 +128,11 @@
                 <version>${mapstruct.version}</version>
             </dependency>
             <dependency>
+                <!-- A module of this reactor since the merge, so it moves at the reactor's version
+                     rather than at a pin of its own. -->
                 <groupId>${project.groupId}</groupId>
                 <artifactId>qits-blobstore</artifactId>
-                <version>${qits.blobstore.version}</version>
+                <version>${project.version}</version>
             </dependency>
             <!-- Declared by npm, maven and oci, one each: the three modules that read rows. It
                  cannot ride in on `common`, which holds a body reader and no database code at all,

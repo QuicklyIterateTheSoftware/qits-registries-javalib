@@ -1,11 +1,11 @@
 package eu.wohlben.qits.registry;
 
-import eu.wohlben.qits.artifacts.error.ArtifactsException;
-import eu.wohlben.qits.artifacts.error.BadRequestException;
-import eu.wohlben.qits.artifacts.error.NotFoundException;
+import eu.wohlben.qits.blobstore.error.ArtifactsException;
+import eu.wohlben.qits.blobstore.error.BadRequestException;
+import eu.wohlben.qits.blobstore.error.NotFoundException;
 import eu.wohlben.qits.artifacts.error.OciCode;
 import eu.wohlben.qits.artifacts.error.OciException;
-import eu.wohlben.qits.artifacts.error.PayloadTooLargeException;
+import eu.wohlben.qits.blobstore.error.PayloadTooLargeException;
 import io.vertx.core.http.HttpHeaders;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;

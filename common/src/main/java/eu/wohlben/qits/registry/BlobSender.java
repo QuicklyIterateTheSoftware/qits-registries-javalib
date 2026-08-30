@@ -1,6 +1,6 @@
 package eu.wohlben.qits.registry;
 
-import eu.wohlben.qits.artifacts.control.BlobStore;
+import eu.wohlben.qits.blobstore.control.BlobStore;
 import io.vertx.core.Handler;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpServerResponse;
@@ -76,7 +76,7 @@ public class BlobSender {
    *
    * @param what how this blob is named in the debug log, in the caller's own terms ({@code "npm
    *     tarball left-pad@1.3.0"}), never a bare digest a reader would have to trace back
-   * @throws eu.wohlben.qits.artifacts.error.NotFoundException there is no such blob — thrown before
+   * @throws eu.wohlben.qits.blobstore.error.NotFoundException there is no such blob — thrown before
    *     anything is written, so the caller's error handler can still answer it
    */
   public void send(HttpServerResponse response, String blobId, String what) {

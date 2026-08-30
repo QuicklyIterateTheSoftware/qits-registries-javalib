@@ -1,111 +1,41 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <!-- The content-addressed blob store, extracted from qits-platform-artifacts (phase 1 of
-         byte-plane-split-plan.md). A plain library jar: named, typed repositories; SHA-256
-         content-addressed blobs in chunked PostgreSQL rows; flat string metadata. NO web, NO JAX-RS, and NOTHING that
-         names a package format — npm, maven and OCI live in qits-registries, which depends on this.
+    <parent>
+        <groupId>eu.wohlben.qits</groupId>
+        <artifactId>qits-registries</artifactId>
+        <version>2026.830.132953</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <!-- The content-addressed blob store, the layer the three format modules write through: named,
+         typed repositories; SHA-256 content-addressed blobs in chunked PostgreSQL rows; flat string
+         metadata. NO web, NO JAX-RS, and NOTHING that names a package format.
+
+         Its own repository until 2026-08-30, merged here with its history (phase 3 of
+         wrapper-reorganization-plan.md). The store and the protocols over it are one component and
+         now ship as one version: the coordinate `eu.wohlben.qits:qits-blobstore` is unchanged — it
+         is a platform-wide contract — but the version is the reactor's, so `deploy` at the root
+         publishes the store beside the formats.
+
+         PACKAGE RENAMED in the same merge: these classes were `eu.wohlben.qits.artifacts.*`, left
+         over from the extraction out of qits-platform-artifacts, and are `eu.wohlben.qits.blobstore.*`
+         now. The CONFIG KEYS are deliberately untouched (`qits.artifacts.blobs-datasource` and the
+         two below it): they are set in deployed services' environments, and a rename there is a
+         live-config break rather than a source one.
 
          NO FLYWAY MIGRATIONS. A lib does not own a schema; each consuming service does. The JPA
          entities travel as they are, so a service that owns the tables gets the same mappings. The
-         test suite generates their schema from those entities (drop-and-create), which is also what
-         keeps the mappings honest without a migration chain to carry. The three blob tables have no
+         test suite generates their schema from those entities (drop-and-create), which is what keeps
+         the mappings honest without a migration chain to carry. The three blob tables have no
          entities — the store speaks plain JDBC — so they ship as reference DDL at
          src/main/resources/db/blobstore-tables.sql, which each consumer copies into its own lineage
          and which this suite applies verbatim.
 
-         Package names are UNCHANGED (eu.wohlben.qits.artifacts.*) on purpose: the service-side
-         switch to this jar is then an import-free diff and every entity/table mapping stays put.
-
-         One module, because that is the whole lib. Modelled on qits-platform-artifacts' root pom +
-         artifacts/pom.xml (same Quarkus BOM, same jandex/annotation processing), trimmed to what
-         this jar needs. One platform artifact, qits-db-core, which is why the <repositories> block
-         below exists; everything else comes from Maven Central. -->
-    <groupId>eu.wohlben.qits</groupId>
+         FIRST MODULE IN THE REACTOR, because `common` and all three formats depend on it. -->
     <artifactId>qits-blobstore</artifactId>
-    <!-- BRANCH VERSION. `postgres-blobs` moves this jar's only backend to PostgreSQL, and every
-         consumer has to move with it in the same campaign — so the branch must be invisible to the
-         calver train and to a ship-mains bootstrap until they are all ready. A -SNAPSHOT the
-         consumer branches pin exactly is what keeps it that way; the release restamps calver. -->
-    <version>2026.830.132821</version>
-    <packaging>jar</packaging>
-    <name>qits-blobstore</name>
-
-    <properties>
-        <maven.compiler.release>25</maven.compiler.release>
-        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
-
-        <quarkus.platform.artifact-id>quarkus-bom</quarkus.platform.artifact-id>
-        <quarkus.platform.group-id>io.quarkus.platform</quarkus.platform.group-id>
-        <quarkus.platform.version>3.34.6</quarkus.platform.version>
-
-        <!-- DbRetry, the read/write patience seam. Published by
-             libs/qits-integrations-quarkus, so it is the one dependency here that is neither on
-             Maven Central nor in the Quarkus platform — see the <repositories> block below. A
-             clone still builds with that repository reachable, or offline once the jar is in
-             ~/.m2. -->
-        <qits.db-core.version>2026.817.175344</qits.db-core.version>
-        <qits.maven.repository.url>http://registry.dev.localhost:8080/artifacts/maven/maven</qits.maven.repository.url>
-
-        <compiler-plugin.version>3.15.0</compiler-plugin.version>
-        <surefire-plugin.version>3.5.4</surefire-plugin.version>
-        <jandex-plugin.version>3.4.0</jandex-plugin.version>
-        <!-- Real postgres for the test suite: binaries resolved as ordinary Maven artifacts and
-             run as a child process, so a clone still builds and tests green with no docker. 18.4.0
-             matches the platform's own qits-oci-postgresql image. -->
-        <zonky.embedded-postgres.version>2.2.2</zonky.embedded-postgres.version>
-        <zonky.postgres-binaries.version>18.4.0</zonky.postgres-binaries.version>
-
-        <lombok.version>1.18.38</lombok.version>
-        <lombok-mapstruct-binding.version>0.2.0</lombok-mapstruct-binding.version>
-        <mapstruct.version>1.6.3</mapstruct.version>
-    </properties>
-
-    <dependencyManagement>
-        <dependencies>
-            <dependency>
-                <groupId>${quarkus.platform.group-id}</groupId>
-                <artifactId>${quarkus.platform.artifact-id}</artifactId>
-                <version>${quarkus.platform.version}</version>
-                <type>pom</type>
-                <scope>import</scope>
-            </dependency>
-            <dependency>
-                <!-- Which postgres the embedded binaries ARE. Imported as a BOM because the per-arch
-                     artifacts below are separate coordinates. -->
-                <groupId>io.zonky.test.postgres</groupId>
-                <artifactId>embedded-postgres-binaries-bom</artifactId>
-                <version>${zonky.postgres-binaries.version}</version>
-                <type>pom</type>
-                <scope>import</scope>
-            </dependency>
-            <dependency>
-                <groupId>org.projectlombok</groupId>
-                <artifactId>lombok</artifactId>
-                <version>${lombok.version}</version>
-                <scope>provided</scope>
-            </dependency>
-            <dependency>
-                <groupId>org.mapstruct</groupId>
-                <artifactId>mapstruct</artifactId>
-                <version>${mapstruct.version}</version>
-            </dependency>
-        </dependencies>
-    </dependencyManagement>
-
-    <repositories>
-        <!-- The platform's own Maven repository, where qits-db-core is published. The id is what a
-             locally cached copy is recorded under, so it has to stay `qits-maven` or an offline
-             build refuses an artifact it already has. -->
-        <repository>
-            <id>qits-maven</id>
-            <url>${qits.maven.repository.url}</url>
-        </repository>
-    </repositories>
+    <name>qits-registries :: blobstore</name>
 
     <dependencies>
         <dependency>
@@ -119,7 +49,6 @@
                  patience without restating a dependency. -->
             <groupId>${project.groupId}</groupId>
             <artifactId>qits-db-core</artifactId>
-            <version>${qits.db-core.version}</version>
         </dependency>
         <dependency>
             <!-- The blob store speaks plain JDBC against an AgroalDataSource it looks up by name,
@@ -169,14 +98,12 @@
         <dependency>
             <groupId>io.zonky.test</groupId>
             <artifactId>embedded-postgres</artifactId>
-            <version>${zonky.embedded-postgres.version}</version>
             <scope>test</scope>
         </dependency>
         <dependency>
             <!-- Named per architecture on purpose: the binaries are separate artifacts and zonky
                  picks one at run time, so an unnamed arch fails in the middle of a suite rather than
-                 during resolution. These three are what this platform is built and developed on —
-                 the same three the qits-workspaces and qits-deployments suites name. -->
+                 during resolution. These three are what this platform is built and developed on. -->
             <groupId>io.zonky.test.postgres</groupId>
             <artifactId>embedded-postgres-binaries-linux-amd64</artifactId>
             <scope>test</scope>
@@ -202,54 +129,15 @@
         <plugins>
             <plugin>
                 <artifactId>maven-compiler-plugin</artifactId>
-                <version>${compiler-plugin.version}</version>
-                <configuration>
-                    <parameters>true</parameters>
-                    <!-- Incremental compilation leaves stale MapStruct *Impl classes behind when a
-                         mapper's shape changes. -->
-                    <useIncrementalCompilation>false</useIncrementalCompilation>
-                    <annotationProcessorPaths>
-                        <path>
-                            <groupId>org.projectlombok</groupId>
-                            <artifactId>lombok</artifactId>
-                            <version>${lombok.version}</version>
-                        </path>
-                        <path>
-                            <groupId>org.mapstruct</groupId>
-                            <artifactId>mapstruct-processor</artifactId>
-                            <version>${mapstruct.version}</version>
-                        </path>
-                        <path>
-                            <groupId>org.projectlombok</groupId>
-                            <artifactId>lombok-mapstruct-binding</artifactId>
-                            <version>${lombok-mapstruct-binding.version}</version>
-                        </path>
-                    </annotationProcessorPaths>
-                </configuration>
             </plugin>
             <plugin>
                 <artifactId>maven-surefire-plugin</artifactId>
-                <version>${surefire-plugin.version}</version>
-                <configuration>
-                    <systemPropertyVariables>
-                        <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
-                    </systemPropertyVariables>
-                </configuration>
             </plugin>
             <plugin>
                 <!-- Index the jar so a consuming app discovers its CDI beans and entities without a
                      quarkus.index-dependency entry. -->
                 <groupId>io.smallrye</groupId>
                 <artifactId>jandex-maven-plugin</artifactId>
-                <version>${jandex-plugin.version}</version>
-                <executions>
-                    <execution>
-                        <id>make-index</id>
-                        <goals>
-                            <goal>jandex</goal>
-                        </goals>
-                    </execution>
-                </executions>
             </plugin>
         </plugins>
     </build>

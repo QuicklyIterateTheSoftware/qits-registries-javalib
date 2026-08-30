@@ -1,6 +1,6 @@
 package eu.wohlben.qits.artifacts.control;
 
-import eu.wohlben.qits.artifacts.error.InternalServerErrorException;
+import eu.wohlben.qits.blobstore.error.InternalServerErrorException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Base64;

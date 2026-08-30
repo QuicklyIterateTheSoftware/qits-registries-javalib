@@ -6,8 +6,8 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.JsonNode;
-import eu.wohlben.qits.artifacts.control.ArtifactRepositoryService;
-import eu.wohlben.qits.artifacts.entity.RepositoryTypeProfile;
+import eu.wohlben.qits.blobstore.control.ArtifactRepositoryService;
+import eu.wohlben.qits.blobstore.entity.RepositoryTypeProfile;
 import eu.wohlben.qits.artifacts.persistence.NpmVersionRepository;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
