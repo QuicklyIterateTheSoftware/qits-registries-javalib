@@ -1,4 +1,4 @@
-# qits-registries
+# qits-registries-javalib
 
 The platform's **byte plane**: the content-addressed blob store, and the npm, maven and OCI
 registry protocols written over it. Five library jars, one reactor, one version.
