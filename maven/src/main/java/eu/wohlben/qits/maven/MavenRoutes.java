@@ -1,6 +1,6 @@
 package eu.wohlben.qits.maven;
 
-import eu.wohlben.qits.artifacts.control.BlobStore;
+import eu.wohlben.qits.blobstore.control.BlobStore;
 import eu.wohlben.qits.artifacts.control.MavenChecksums;
 import eu.wohlben.qits.artifacts.control.MavenLayout;
 import eu.wohlben.qits.artifacts.control.MavenPackagesProfile;

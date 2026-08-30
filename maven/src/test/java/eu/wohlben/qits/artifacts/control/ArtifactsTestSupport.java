@@ -1,7 +1,7 @@
 package eu.wohlben.qits.artifacts.control;
 
-import eu.wohlben.qits.artifacts.persistence.ArtifactRecordRepository;
-import eu.wohlben.qits.artifacts.persistence.ArtifactRepositoryRepository;
+import eu.wohlben.qits.blobstore.persistence.ArtifactRecordRepository;
+import eu.wohlben.qits.blobstore.persistence.ArtifactRepositoryRepository;
 import eu.wohlben.qits.artifacts.persistence.MavenArtifactRepository;
 import eu.wohlben.qits.artifacts.persistence.MavenProxyMetadataRepository;
 import io.agroal.api.AgroalDataSource;

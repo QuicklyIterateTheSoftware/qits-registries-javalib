@@ -1,5 +1,6 @@
 package eu.wohlben.qits.artifacts.error;
 
+import eu.wohlben.qits.blobstore.error.ArtifactsException;
 import java.util.Map;
 
 /**

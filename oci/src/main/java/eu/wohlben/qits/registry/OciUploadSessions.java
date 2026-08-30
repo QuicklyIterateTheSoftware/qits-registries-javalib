@@ -1,6 +1,6 @@
 package eu.wohlben.qits.registry;
 
-import eu.wohlben.qits.artifacts.control.BlobStore;
+import eu.wohlben.qits.blobstore.control.BlobStore;
 import eu.wohlben.qits.artifacts.error.OciCode;
 import eu.wohlben.qits.artifacts.error.OciException;
 import jakarta.annotation.PreDestroy;

@@ -4,7 +4,7 @@ import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 
-import eu.wohlben.qits.artifacts.control.ArtifactRepositoryService;
+import eu.wohlben.qits.blobstore.control.ArtifactRepositoryService;
 import eu.wohlben.qits.artifacts.control.OciMirrorUpstreams;
 import eu.wohlben.qits.artifacts.control.OciImagesProfile;
 import io.quarkus.test.junit.QuarkusTest;

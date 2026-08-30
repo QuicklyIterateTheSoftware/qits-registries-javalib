@@ -5,8 +5,8 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import eu.wohlben.qits.artifacts.dto.MirrorUpstreamSummary;
-import eu.wohlben.qits.artifacts.error.BadRequestException;
-import eu.wohlben.qits.artifacts.error.NotFoundException;
+import eu.wohlben.qits.blobstore.error.BadRequestException;
+import eu.wohlben.qits.blobstore.error.NotFoundException;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import java.util.List;

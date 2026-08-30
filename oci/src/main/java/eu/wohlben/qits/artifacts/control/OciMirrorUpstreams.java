@@ -1,12 +1,12 @@
 package eu.wohlben.qits.artifacts.control;
 
 import eu.wohlben.qits.artifacts.dto.MirrorUpstreamSummary;
-import eu.wohlben.qits.artifacts.entity.ArtifactRepository;
+import eu.wohlben.qits.blobstore.entity.ArtifactRepository;
 import eu.wohlben.qits.artifacts.entity.OciMirrorUpstream;
-import eu.wohlben.qits.artifacts.entity.RepositoryTypeProfile;
-import eu.wohlben.qits.artifacts.error.BadRequestException;
-import eu.wohlben.qits.artifacts.error.NotFoundException;
-import eu.wohlben.qits.artifacts.persistence.ArtifactRepositoryRepository;
+import eu.wohlben.qits.blobstore.entity.RepositoryTypeProfile;
+import eu.wohlben.qits.blobstore.error.BadRequestException;
+import eu.wohlben.qits.blobstore.error.NotFoundException;
+import eu.wohlben.qits.blobstore.persistence.ArtifactRepositoryRepository;
 import eu.wohlben.qits.artifacts.persistence.OciManifestRepository;
 import eu.wohlben.qits.artifacts.persistence.OciMirrorUpstreamRepository;
 import jakarta.enterprise.context.ApplicationScoped;

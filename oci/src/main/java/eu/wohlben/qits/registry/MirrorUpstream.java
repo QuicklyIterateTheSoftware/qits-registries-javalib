@@ -1,6 +1,6 @@
 package eu.wohlben.qits.registry;
 
-import eu.wohlben.qits.artifacts.control.BlobStore;
+import eu.wohlben.qits.blobstore.control.BlobStore;
 import eu.wohlben.qits.artifacts.control.OciDigest;
 import eu.wohlben.qits.artifacts.control.OciImageName;
 import eu.wohlben.qits.artifacts.control.OciManifestParser;

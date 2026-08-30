@@ -5,7 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import eu.wohlben.qits.artifacts.control.NpmPackageName;
 import eu.wohlben.qits.artifacts.control.NpmRegistryService;
-import eu.wohlben.qits.artifacts.error.InternalServerErrorException;
+import eu.wohlben.qits.blobstore.error.InternalServerErrorException;
 import eu.wohlben.qits.artifacts.error.NpmException;
 import java.util.List;
 import java.util.Map;

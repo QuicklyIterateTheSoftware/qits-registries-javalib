@@ -2,7 +2,7 @@ package eu.wohlben.qits.npm;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import eu.wohlben.qits.artifacts.control.BlobStore;
+import eu.wohlben.qits.blobstore.control.BlobStore;
 import eu.wohlben.qits.artifacts.control.NpmPackageName;
 import eu.wohlben.qits.artifacts.control.NpmRegistryService;
 import eu.wohlben.qits.artifacts.error.NpmException;

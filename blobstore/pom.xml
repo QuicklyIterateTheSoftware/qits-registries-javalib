@@ -1,0 +1,144 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>eu.wohlben.qits</groupId>
+        <artifactId>qits-registries</artifactId>
+        <version>2026.830.175757</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <!-- The content-addressed blob store, the layer the three format modules write through: named,
+         typed repositories; SHA-256 content-addressed blobs in chunked PostgreSQL rows; flat string
+         metadata. NO web, NO JAX-RS, and NOTHING that names a package format.
+
+         Its own repository until 2026-08-30, merged here with its history (phase 3 of
+         wrapper-reorganization-plan.md). The store and the protocols over it are one component and
+         now ship as one version: the coordinate `eu.wohlben.qits:qits-blobstore` is unchanged — it
+         is a platform-wide contract — but the version is the reactor's, so `deploy` at the root
+         publishes the store beside the formats.
+
+         PACKAGE RENAMED in the same merge: these classes were `eu.wohlben.qits.artifacts.*`, left
+         over from the extraction out of qits-platform-artifacts, and are `eu.wohlben.qits.blobstore.*`
+         now. The CONFIG KEYS are deliberately untouched (`qits.artifacts.blobs-datasource` and the
+         two below it): they are set in deployed services' environments, and a rename there is a
+         live-config break rather than a source one.
+
+         NO FLYWAY MIGRATIONS. A lib does not own a schema; each consuming service does. The JPA
+         entities travel as they are, so a service that owns the tables gets the same mappings. The
+         test suite generates their schema from those entities (drop-and-create), which is what keeps
+         the mappings honest without a migration chain to carry. The three blob tables have no
+         entities — the store speaks plain JDBC — so they ship as reference DDL at
+         src/main/resources/db/blobstore-tables.sql, which each consumer copies into its own lineage
+         and which this suite applies verbatim.
+
+         FIRST MODULE IN THE REACTOR, because `common` and all three formats depend on it. -->
+    <artifactId>qits-blobstore</artifactId>
+    <name>qits-registries :: blobstore</name>
+
+    <dependencies>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-arc</artifactId>
+        </dependency>
+        <dependency>
+            <!-- DbRetry: this jar's own reads and writes hold through a postgres cutover, so the
+                 class is named in these sources and the scope is compile. It also reaches every
+                 consumer, which is the point — a service that owns these tables gets the same
+                 patience without restating a dependency. -->
+            <groupId>${project.groupId}</groupId>
+            <artifactId>qits-db-core</artifactId>
+        </dependency>
+        <dependency>
+            <!-- The blob store speaks plain JDBC against an AgroalDataSource it looks up by name,
+                 so the class and the lookup helper are named in these sources. Compile scope, and
+                 explicit rather than transitive through Panache, because this jar depends on the
+                 API rather than merely inheriting it. -->
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-agroal</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-hibernate-orm-panache</artifactId>
+        </dependency>
+        <dependency>
+            <!-- ObjectMapper bean for services that read/write JSON (no REST needed). -->
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-jackson</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-hibernate-validator</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.mapstruct</groupId>
+            <artifactId>mapstruct</artifactId>
+        </dependency>
+        <dependency>
+            <!-- TEST SCOPE, unlike the module this came from: a library must not pick the consuming
+                 service's database. The suite runs the JPA entities on in-memory H2 — they are
+                 engine-neutral and each consumer maps them onto its own store — and the blob tables
+                 on real postgres, which is the only engine the blob store has. -->
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-jdbc-h2</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <!-- The blob store's engine. Test scope here for the same reason H2 is: the consumer
+                 ships the driver its deployment needs. -->
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-jdbc-postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.zonky.test</groupId>
+            <artifactId>embedded-postgres</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <!-- Named per architecture on purpose: the binaries are separate artifacts and zonky
+                 picks one at run time, so an unnamed arch fails in the middle of a suite rather than
+                 during resolution. These three are what this platform is built and developed on. -->
+            <groupId>io.zonky.test.postgres</groupId>
+            <artifactId>embedded-postgres-binaries-linux-amd64</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.zonky.test.postgres</groupId>
+            <artifactId>embedded-postgres-binaries-linux-arm64v8</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.zonky.test.postgres</groupId>
+            <artifactId>embedded-postgres-binaries-darwin-arm64v8</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-junit5</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <artifactId>maven-compiler-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <artifactId>maven-surefire-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <!-- Index the jar so a consuming app discovers its CDI beans and entities without a
+                     quarkus.index-dependency entry. -->
+                <groupId>io.smallrye</groupId>
+                <artifactId>jandex-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>
