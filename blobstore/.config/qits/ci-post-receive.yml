@@ -1,0 +1,17 @@
+steps:
+  - image: qits/build-images/maven-base:latest
+    timeout-seconds: 1800
+    script: |
+      set -eu
+      # qits-db-core resolves from the platform registry; the pom's default
+      # names localhost:8081, unreachable from inside a step container, and
+      # the derived address needs the exact-id mirror to pass Maven's HTTP
+      # blocker (see .qits-maven-settings.xml).
+      #
+      # No `user:` stanza, unlike qits-eventstream's: this suite runs on
+      # in-memory H2, so nothing here spawns postgres binaries and root is
+      # fine. Add one the day a test needs initdb, which refuses to run as
+      # root.
+      export QITS_MAVEN_REPOSITORY_URL="$QITS_MAVEN_REGISTRY_URL"
+      ./mvnw -B -ntp -s .qits-maven-settings.xml verify \
+        -Dqits.maven.repository.url="$QITS_MAVEN_REPOSITORY_URL"

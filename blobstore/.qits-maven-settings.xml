@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<settings xmlns="http://maven.apache.org/SETTINGS/1.2.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.2.0 https://maven.apache.org/xsd/settings-1.2.0.xsd">
+  <mirrors>
+    <!-- Exact repository-id matches win over Maven's external:http:* blocker. This permits only
+         the platform's own repository URL supplied to the step, not arbitrary HTTP repos.
+
+         Read only by the two pipelines in .config/qits (`-s .qits-maven-settings.xml`), which run
+         inside a step container and reach the registry at a non-localhost address. A developer's
+         build needs none of it, because the pom's default address is on localhost and the blocker
+         exempts localhost. Same file, same reason, as qits-eventstream's. -->
+    <mirror>
+      <id>qits-maven-network</id>
+      <mirrorOf>qits-maven</mirrorOf>
+      <url>${env.QITS_MAVEN_REPOSITORY_URL}</url>
+    </mirror>
+  </mirrors>
+</settings>
