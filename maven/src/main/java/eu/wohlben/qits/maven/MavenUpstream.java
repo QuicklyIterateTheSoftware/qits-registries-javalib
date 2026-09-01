@@ -83,7 +83,7 @@ public class MavenUpstream {
   @ConfigProperty(name = "qits.artifacts.maven.proxy.metadata-ttl", defaultValue = "PT1H")
   Duration metadataTtl;
 
-  @ConfigProperty(name = "qits.artifacts.maven.max-artifact-size", defaultValue = "128M")
+  @ConfigProperty(name = "qits.artifacts.maven.max-artifact-size", defaultValue = "512M")
   MemorySize maxArtifactSize;
 
   /**
@@ -188,6 +188,16 @@ public class MavenUpstream {
       throw new MavenException(502, "interrupted fetching " + path);
     } catch (MavenException already) {
       throw already;
+    } catch (eu.wohlben.qits.blobstore.error.PayloadTooLargeException tooLarge) {
+      // NOT "unreachable": upstream answered and streamed until the size cap tripped. Collapsing
+      // this into the catch below cost 2026-09-01 an evening — every userflows build 502ed on the
+      // 201M playwright driver-bundle while the message sent everyone to the network.
+      throw new MavenException(
+          413,
+          path
+              + " is larger than qits.artifacts.maven.max-artifact-size ("
+              + maxArtifactSize.asLongValue()
+              + " bytes) and was not cached — raise the cap to proxy it");
     } catch (Exception unreachable) {
       LOG.debugf(unreachable, "maven proxy: could not fetch %s", path);
       throw new MavenException(
