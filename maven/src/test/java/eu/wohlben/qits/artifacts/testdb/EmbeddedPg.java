@@ -55,6 +55,12 @@ public final class EmbeddedPg {
       // start at all still fails, just with the real error.
       started = EmbeddedPostgres.builder().setPGStartupWait(java.time.Duration.ofSeconds(60)).start();
     } catch (Exception e) {
+      // Printed BEFORE the throw, deliberately: this runs while MicroProfile config sources load,
+      // so the throw surfaces as ServiceConfigurationError "could not be instantiated" with the
+      // cause visible only in a dumpstream file inside a container that is already gone — measured
+      // three times on 2026-09-01. Stderr reaches surefire's output and the step's recorded tail.
+      System.err.println("embedded postgres failed to start:");
+      e.printStackTrace();
       throw new IllegalStateException("could not start the embedded postgres", e);
     }
     System.setProperty(PORT_PROPERTY, String.valueOf(started.getPort()));
