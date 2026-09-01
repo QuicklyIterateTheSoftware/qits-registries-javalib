@@ -1,5 +1,11 @@
 steps:
   - image: qits/build-images/maven-base:latest
+    # Runs as the image's non-root build user (uid 1001, with a passwd entry). Zonky's embedded
+    # postgres calls initdb, and initdb REFUSES to run as root — measured 2026-09-01, every gating
+    # run failing with EmbeddedPgConfigSource "could not be instantiated" over an initdb that exited
+    # under uid 0. The script's own note below anticipated this exact fix; the blobstore module is
+    # the fifth suite here to spawn zonky and the first to be gated as root.
+    user: build
     timeout-seconds: 1800
     script: |
       set -eu
