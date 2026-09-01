@@ -48,7 +48,12 @@ public final class EmbeddedPg {
       return Integer.parseInt(recorded);
     }
     try {
-      started = EmbeddedPostgres.builder().start();
+      // Zonky's default startup wait is 10s of WALL time, and a CI host draining a full run queue
+      // spends more than that between initdb and "ready" — measured twice on 2026-09-01, each time
+      // as this ConfigSource "could not be instantiated" with zero tests run and the cause buried
+      // in a dumpstream nobody can read. A minute is patience, not a hang: a postgres that cannot
+      // start at all still fails, just with the real error.
+      started = EmbeddedPostgres.builder().setPGStartupWait(java.time.Duration.ofSeconds(60)).start();
     } catch (Exception e) {
       throw new IllegalStateException("could not start the embedded postgres", e);
     }
