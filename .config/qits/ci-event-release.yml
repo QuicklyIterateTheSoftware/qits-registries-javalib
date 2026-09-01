@@ -53,6 +53,10 @@ steps:
       # mirror in .qits-maven-settings.xml to get past Maven's HTTP blocker — the same pair every
       # service's image build uses.
       export QITS_MAVEN_REPOSITORY_URL="$QITS_MAVEN_REGISTRY_URL"
+      # Maven Central through the platform mirror's in-network alias — empty (an older qits-ci that
+      # injects nothing, or a deployment that turned the mirror plane off) deactivates the settings
+      # profile and Central is resolved directly.
+      export QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_PROXY_URL:-}"
       # This script is read from main's head, but the checkout above is the release TAG — which may
       # predate a file the script names. Guard on presence: a tree old enough to lack the mirror
       # also predates the platform dependencies that need it.
