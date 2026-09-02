@@ -42,6 +42,19 @@ final class MavenPaths {
   static final String ARTIFACT = route(REPOSITORY + "/(?<path>.+)");
 
   /**
+   * The same artifact grammar under an arbitrary mount, for a deployment that answers on a SECOND
+   * base beside {@link #BASE}. The pull-through mirror uses it to serve its caches under its own
+   * {@code /mirror} prefix — the edge routes {@code /artifacts} to the hosted registry that owns
+   * that route, so the mirror is unreachable there through the edge, while {@code /mirror} is its
+   * own. The named groups are identical to {@link #ARTIFACT}, so every {@code pathParam} in the
+   * handlers is mount-agnostic and one set of handlers serves both. A method, not a constant, for
+   * the inlining reason on {@link #route}.
+   */
+  static String artifactRoute(String mount) {
+    return mount + "/" + REPOSITORY + "/(?<path>.+)";
+  }
+
+  /**
    * Builds a route regex under {@link #BASE}.
    *
    * <p>A method call rather than string concatenation, and that is not styling — the reason is
