@@ -28,6 +28,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
@@ -100,22 +101,43 @@ public class MavenRoutes {
   @ConfigProperty(name = "qits.artifacts.maven.max-artifact-size", defaultValue = "128M")
   MemorySize maxArtifactSize;
 
+  /**
+   * A SECOND mount the maven wire also answers on, beside {@link MavenPaths#BASE}. Empty for the
+   * hosted registry, which owns {@code /artifacts}; the pull-through mirror sets it to {@code
+   * /mirror/maven} so its caches are reachable through the edge on the mirror's OWN route — the edge
+   * routes {@code /artifacts} to the hosted registry (its primary route travels to every vhost), so
+   * a build reaching the mirror vhost at {@code /artifacts/maven/central} is handed to the registry
+   * and 404s. Additive on purpose: {@code /artifacts/maven} keeps answering in-network so no
+   * consumer has to migrate atomically.
+   */
+  @ConfigProperty(name = "qits.registries.maven.mirror-mount")
+  Optional<String> mirrorMount;
+
   void init(@Observes Router router) {
+    registerMount(router, MavenPaths.BASE, MavenPaths.ARTIFACT);
+    mirrorMount
+        .map(String::trim)
+        .filter(mount -> !mount.isEmpty())
+        .ifPresent(mount -> registerMount(router, mount, MavenPaths.artifactRoute(mount)));
+  }
+
+  /**
+   * Registers the whole maven wire under one mount. Called once for {@link MavenPaths#BASE} and,
+   * on the mirror, once more for {@link #mirrorMount}. The handlers read the named path groups and
+   * never the mount, so both mounts share one set — see {@link MavenPaths#artifactRoute}.
+   */
+  private void registerMount(Router router, String base, String artifact) {
     // HEAD is NOT derived from GET by Vert.x — every GET route needs its HEAD twin, or every client
     // that probes before downloading sees a 404.
-    router
-        .headWithRegex(MavenPaths.ARTIFACT)
-        .blockingHandler(guarded("head artifact", rc -> serve(rc, false)));
-    router
-        .getWithRegex(MavenPaths.ARTIFACT)
-        .blockingHandler(guarded("get artifact", rc -> serve(rc, true)));
+    router.headWithRegex(artifact).blockingHandler(guarded("head artifact", rc -> serve(rc, false)));
+    router.getWithRegex(artifact).blockingHandler(guarded("get artifact", rc -> serve(rc, true)));
 
     // The deploy PUT streams rather than buffers: a BodyHandler would hold the whole artifact in
     // memory, and a raw HttpServerRequest read is bounded by nothing — the two rules OciRequestBody
     // exists for. Hashing to sha256 happens inside the stage, for free, exactly as for npm tarballs
     // and OCI layers.
     router
-        .putWithRegex(MavenPaths.ARTIFACT)
+        .putWithRegex(artifact)
         .handler(OciRequestBody::pauseForWorker)
         .blockingHandler(guarded("deploy", this::deploy));
 
@@ -123,7 +145,7 @@ public class MavenRoutes {
     // append-only and nothing should come to depend on undeploy semantics before they exist. 405
     // rather than 404, which would read as "unknown artifact".
     router
-        .route(HttpMethod.DELETE, MavenPaths.BASE + "/*")
+        .route(HttpMethod.DELETE, base + "/*")
         .handler(
             rc ->
                 MavenErrors.send(
@@ -131,8 +153,8 @@ public class MavenRoutes {
 
     // Everything else under the base is a short plain-text 404, never the SPA's HTML — a maven
     // client told 200 text/html reports anything but "no such path".
-    router.route(MavenPaths.BASE).handler(this::notFound);
-    router.route(MavenPaths.BASE + "/*").handler(this::notFound);
+    router.route(base).handler(this::notFound);
+    router.route(base + "/*").handler(this::notFound);
   }
 
   private void notFound(RoutingContext rc) {
