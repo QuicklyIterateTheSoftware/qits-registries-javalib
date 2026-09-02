@@ -67,3 +67,31 @@ steps:
       ./mvnw -B -ntp $settings deploy -DskipTests \
         -Dqits.maven.repository.url="$QITS_MAVEN_REGISTRY_URL" \
         -DaltDeploymentRepository="qits::default::$QITS_MAVEN_REGISTRY_URL"
+      # THE SBOM IS THE ARTIFACT'S RESOLVED DEPENDENCY TREE, one per declared module, and it goes up
+      # in this step — after the deploy and before the run goes green. qits-ci announces
+      # `SoftwareRelease` only for a green run, so an SBOM published here can never be missing for a
+      # version somebody was told about. A failed PUT fails the release ON PURPOSE.
+      #
+      # ONE makeBom PER MODULE, because a bill of materials is per artifact and a reactor-wide run
+      # would answer for the parent pom instead. THE PAIR IS `directory:artifactId`, and it is a pair
+      # rather than one word for exactly the reason the probe above is written by artifactId: the
+      # directories are the short names this reactor has always used and the coordinates are not —
+      # `blobstore` publishes as `qits-blobstore`. `-pl` wants the left half, the store wants the
+      # right half, and neither may be guessed from the other.
+      #
+      # The plugin resolves from the same repositories mvnw already resolves through, so it needs the
+      # same `$settings` mirror and the same repository property the deploy above needed.
+      sbom_base="${QITS_MAVEN_REGISTRY_URL%%/artifacts/*}/artifacts/sboms"
+      for pair in blobstore:qits-blobstore common:qits-registries-common \
+                  npm:qits-registries-npm maven:qits-registries-maven \
+                  oci:qits-registries-oci; do
+        module=${pair%%:*}
+        artifact=${pair#*:}
+        ./mvnw -B -ntp $settings -DskipTests -pl "$module" \
+          org.cyclonedx:cyclonedx-maven-plugin:2.9.1:makeBom \
+          -DoutputFormat=json -DoutputName=sbom -DschemaVersion=1.6 \
+          -Dqits.maven.repository.url="$QITS_MAVEN_REGISTRY_URL"
+        curl -fsS -X PUT -H 'Content-Type: application/vnd.cyclonedx+json' \
+          --data-binary "@$module/target/sbom.json" \
+          "$sbom_base/maven/eu.wohlben.qits:$artifact/-/$version"
+      done

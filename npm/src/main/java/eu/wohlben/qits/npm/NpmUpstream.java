@@ -174,6 +174,17 @@ public class NpmUpstream {
       throw new NpmException(502, "interrupted fetching " + pkg.full() + "@" + version);
     } catch (NpmException already) {
       throw already;
+    } catch (eu.wohlben.qits.blobstore.error.PayloadTooLargeException tooLarge) {
+      // NOT "unreachable": upstream answered and streamed until the size cap tripped. The maven
+      // proxy misreported exactly this on 2026-09-01 and the message sent everyone to the network.
+      throw new NpmException(
+          413,
+          pkg.full()
+              + "@"
+              + version
+              + " is larger than qits.artifacts.npm.max-publish-size ("
+              + maxTarballSize.asLongValue()
+              + " bytes) and was not cached — raise the cap to proxy it");
     } catch (Exception unreachable) {
       LOG.debugf(unreachable, "npm proxy: could not fetch %s@%s", pkg.full(), version);
       throw new NpmException(

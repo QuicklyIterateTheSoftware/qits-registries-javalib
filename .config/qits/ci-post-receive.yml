@@ -1,5 +1,11 @@
 steps:
   - image: qits/build-images/maven-base:latest
+    # Runs as the image's non-root build user (uid 1001, with a passwd entry). Zonky's embedded
+    # postgres calls initdb, and initdb REFUSES to run as root — measured 2026-09-01, every gating
+    # run failing with EmbeddedPgConfigSource "could not be instantiated" over an initdb that exited
+    # under uid 0. The script's own note below anticipated this exact fix; the blobstore module is
+    # the fifth suite here to spawn zonky and the first to be gated as root.
+    user: build
     timeout-seconds: 1800
     script: |
       set -eu
@@ -19,5 +25,15 @@ steps:
       # injects nothing, or a deployment that turned the mirror plane off) deactivates the settings
       # profile and Central is resolved directly.
       export QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_PROXY_URL:-}"
+      # `id` first and the dumpstreams on failure: a surefire fork that dies during config-source
+      # loading (the embedded postgres) reports "could not be instantiated" with the cause in a
+      # dumpstream file inside this container — which is gone when anyone reads the run. Four gating
+      # runs failed unreadably like that on 2026-09-01 before this block existed.
+      id
       ./mvnw -B -ntp -s .qits-maven-settings.xml verify \
-        -Dqits.maven.repository.url="$QITS_MAVEN_REPOSITORY_URL"
+        -Dqits.maven.repository.url="$QITS_MAVEN_REPOSITORY_URL" || {
+        echo '=== surefire dumpstreams (fork died before tests) ==='
+        find . -path '*/surefire-reports/*.dumpstream' -exec cat {} + 2>/dev/null | head -80
+        df -h /tmp /workspace 2>/dev/null
+        exit 1
+      }
