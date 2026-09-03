@@ -36,7 +36,7 @@
     <!-- One version for the whole byte plane. Every module carries it verbatim — this repository
          duplicates the version rather than deriving it, so the release stamp rewrites one literal
          per pom — and `deploy` at the root publishes them together. -->
-    <version>2026.902.190920</version>
+    <version>2026.903.85122</version>
     <packaging>pom</packaging>
     <name>qits-registries</name>
 
@@ -54,7 +54,7 @@
     <properties>
         <!-- DbRetry, the read patience seam. Published by libs/qits-integrations-quarkus, so it is
              pinned to a released calver rather than following a snapshot. -->
-        <qits.db-core.version>2026.817.175344</qits.db-core.version>
+        <qits.db-core.version>2026.902.53026</qits.db-core.version>
         <qits.maven.repository.url>http://registry.dev.localhost:8080/artifacts/maven/maven</qits.maven.repository.url>
         <maven.compiler.release>25</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
