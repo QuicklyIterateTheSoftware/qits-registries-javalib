@@ -1,3 +1,15 @@
+event: ReleaseRequestChanged
+
+when:
+  # repoName, not repoId: the git host's storage coordinate is an opaque UUID since
+  # the identity cutover, so a name match on repoId is not dependable. The event
+  # echoes the public name; a rename updates this line in the same campaign.
+  - repoName: { exact: qits-registries-javalib }
+
+checkout:
+  branch: backingBranch
+  sha: mergedSha
+
 steps:
   - image: qits/build-images/maven-base:latest
     # Runs as the image's non-root build user (uid 1001, with a passwd entry). Zonky's embedded
