@@ -1,15 +1,17 @@
-# THE TAG STARTS THIS, NOT THE RELEASE ANNOUNCEMENT. `SCMPublishTag` is the git host's fact that a
-# tag ref landed, so this reactor is deployed for a real release AND for a bootstrap replay, which
-# pushes the tags and nothing else. That is the restore path this file exists to serve
-# (bootstrap-replay-plan.md in the wrapper). `artifacts:` is a declaration, not an announcement:
-# qits-ci announces `SoftwareRelease` only where a green run and an `SCMRelease` meet, so a replay
-# republishes silently and a real release announces exactly as before.
-event: SCMPublishTag
+# THE VERSION TAG IS STILL THE DURABLE STAMP, BUT IT NO LONGER TRIGGERS. Under the release-request
+# flow the tag is written by qits-githost's tag primitive, which announces nothing — the trigger is
+# qits-projects' `SCMRelease`. A bootstrap replay therefore re-establishes a release by pushing the
+# tag quietly and re-presenting the `SCMRelease` through qits-ci's manual trigger door
+# (`POST /ci/api/events/trigger`), which runs this same pipeline. qits-ci still announces
+# `SoftwareRelease` only where a green run and an `SCMRelease` meet.
+event: SCMRelease
 when:
-  # repoName, not repoId: since the identity cutover the git host's own coordinate is an opaque
-  # UUID, so a name match on repoId never fires. The tag event echoes the public name the push
-  # was addressed with; a rename updates this line in the same campaign.
-  - repoName: { exact: qits-registries-javalib }
+  # SCMRelease, not SCMPublishTag: under the release-request flow the version tag is written by
+  # qits-githost's tag primitive, which fires no post-receive and so publishes no SCMPublishTag —
+  # a recipe listening for the tag event never runs again. qits-projects' Auto Release publishes
+  # SCMRelease carrying the repository's public name, and a bootstrap replay arrives as this same
+  # event through qits-ci's manual trigger door. A rename updates this line in the same campaign.
+  - repository: { exact: qits-registries-javalib }
 artifacts:
   # The store merged in on 2026-08-30 and rides this release. Its coordinate keeps the shape it
   # always had — `qits-blobstore`, not `qits-registries-blobstore` — because consumers pin it and
@@ -27,7 +29,7 @@ steps:
       # THE TAG NAME IS THE VERSION. Nothing upstream vets it now that any tag push reaches here,
       # and it becomes a registry coordinate for five modules, so the shape is checked before
       # anything is fetched or deployed: a CalVer is digits and dots.
-      version=$(printf '%s' "$QITS_EVENT_PAYLOAD" | jq -er .tagName)
+      version=$(printf '%s' "$QITS_EVENT_PAYLOAD" | jq -er .version)
       case "$version" in
         ''|*[!0-9.]*) echo "not a CalVer tag: $version" >&2; exit 1 ;;
       esac
