@@ -82,6 +82,32 @@ public final class NpmClient implements AutoCloseable {
     return send(builder, HttpResponse.BodyHandlers.discarding());
   }
 
+  /** {@code GET /<repo>/-/package/<pkg>/dist-tags} — what {@code npm dist-tag ls} reads. */
+  public HttpResponse<String> distTags(String repository, String pkgPath) {
+    return send(
+        request(repository, "-/package/" + pkgPath + "/dist-tags").GET(),
+        HttpResponse.BodyHandlers.ofString());
+  }
+
+  /**
+   * {@code PUT /<repo>/-/package/<pkg>/dist-tags/<tag>} — what {@code npm dist-tag add} sends, body
+   * included: the version as a JSON string, quotes and all.
+   */
+  public HttpResponse<String> setDistTag(
+      String repository, String pkgPath, String tag, String version) {
+    return distTagBody(repository, pkgPath, tag, "\"" + version + "\"");
+  }
+
+  /** The same PUT with an arbitrary body — for the shapes a hand-written client sends. */
+  public HttpResponse<String> distTagBody(
+      String repository, String pkgPath, String tag, String body) {
+    return send(
+        request(repository, "-/package/" + pkgPath + "/dist-tags/" + tag)
+            .header("Content-Type", "application/json")
+            .PUT(HttpRequest.BodyPublishers.ofString(body)),
+        HttpResponse.BodyHandlers.ofString());
+  }
+
   public HttpResponse<String> delete(String repository, String pkgPath) {
     return send(
         request(repository, pkgPath).DELETE(), HttpResponse.BodyHandlers.ofString());

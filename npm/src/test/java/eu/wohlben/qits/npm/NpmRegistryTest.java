@@ -291,6 +291,181 @@ class NpmRegistryTest {
     }
   }
 
+  // --- dist-tags --------------------------------------------------------------------------------
+
+  @Test
+  void aReleasedVersionCanBeGivenTheMainTagAfterItsPublish() {
+    // THE CASE THIS ENDPOINT EXISTS FOR. `npm publish` names exactly one dist-tag, so a release that
+    // wants its version under both `latest` and `main` cannot say so in the publish document, and
+    // cannot publish twice — versions are immutable. Moving the tag afterwards is the operation npm
+    // has for it, and until now this registry served neither of its two URLs.
+    String name = scopedName();
+    TinyPackage released = TinyPackage.of(name, "2026.905.120000");
+
+    try (NpmClient npm = client()) {
+      assertEquals(
+          201, npm.publish("npm", encoded(name), released.publishDocument("latest")).statusCode());
+      assertEquals(
+          "{\"latest\":\"2026.905.120000\"}",
+          npm.distTags("npm", encoded(name)).body(),
+          "a bare publish claims latest and nothing else");
+
+      HttpResponse<String> moved =
+          npm.setDistTag("npm", encoded(name), "main", "2026.905.120000");
+      assertEquals(200, moved.statusCode(), moved.body());
+      assertEquals(
+          "2026.905.120000",
+          NpmClient.parse(moved.body()).path("main").asText(),
+          "the answer is the package's whole tag map: " + moved.body());
+
+      // And the packument — the document every install resolves against — carries both.
+      JsonNode tags = npm.packumentJson("npm", encoded(name)).path("dist-tags");
+      assertEquals("2026.905.120000", tags.path("latest").asText());
+      assertEquals("2026.905.120000", tags.path("main").asText());
+    }
+  }
+
+  @Test
+  void theMainTagMovesForwardWithEachRelease() {
+    // The whole point of the release recipes' `npm dist-tag add … main`: `main` follows released
+    // mains, so it moves onto the newest one every time, over a tag that already exists — the branch
+    // in moveTag that `latest`'s ordering rule deliberately does not guard.
+    String name = scopedName();
+    TinyPackage first = TinyPackage.of(name, "2026.905.120000");
+    TinyPackage second = TinyPackage.of(name, "2026.906.130000");
+
+    try (NpmClient npm = client()) {
+      npm.publish("npm", encoded(name), first.publishDocument("latest"));
+      npm.setDistTag("npm", encoded(name), "main", "2026.905.120000");
+      npm.publish("npm", encoded(name), second.publishDocument("latest"));
+      assertEquals(
+          200, npm.setDistTag("npm", encoded(name), "main", "2026.906.130000").statusCode());
+
+      JsonNode tags = NpmClient.parse(npm.distTags("npm", encoded(name)).body());
+      assertEquals("2026.906.130000", tags.path("latest").asText());
+      assertEquals("2026.906.130000", tags.path("main").asText());
+    }
+  }
+
+  @Test
+  void anOlderMainIsStillAllowedButAnOlderLatestIsNot() {
+    // The ordering rule belongs to the TAG, not to the route that moves it — so this endpoint
+    // inherits it exactly as the publish path does. `main` moves anywhere, which is what makes it a
+    // useful pointer; `latest` may not step backwards, which is the guard that stops a consumer
+    // installing without a range from silently getting an older build.
+    String name = scopedName();
+    TinyPackage older = TinyPackage.of(name, "2026.905.120000");
+    TinyPackage newer = TinyPackage.of(name, "2026.906.130000");
+
+    try (NpmClient npm = client()) {
+      npm.publish("npm", encoded(name), older.publishDocument("latest"));
+      npm.publish("npm", encoded(name), newer.publishDocument("latest"));
+
+      assertEquals(
+          200,
+          npm.setDistTag("npm", encoded(name), "main", "2026.905.120000").statusCode(),
+          "an unordered tag may point anywhere");
+
+      HttpResponse<String> backwards =
+          npm.setDistTag("npm", encoded(name), "latest", "2026.905.120000");
+      assertEquals(403, backwards.statusCode(), backwards.body());
+      assertTrue(
+          NpmClient.parse(backwards.body()).path("error").asText().contains("2026.906.130000"),
+          "the message names the version latest keeps: " + backwards.body());
+      assertEquals(
+          "2026.906.130000",
+          NpmClient.parse(npm.distTags("npm", encoded(name)).body()).path("latest").asText(),
+          "the refusal left the tag where it was");
+    }
+  }
+
+  @Test
+  void aTagMayNotNameAVersionThatIsNotPublishedHere() {
+    // A dist-tag naming a version the packument does not contain is what every npm client reads as
+    // a broken package — the same invariant garbage collection refuses a deletion to protect,
+    // stated from the other side.
+    String name = scopedName();
+    TinyPackage published = TinyPackage.of(name, "1.0.0");
+
+    try (NpmClient npm = client()) {
+      npm.publish("npm", encoded(name), published.publishDocument("latest"));
+      HttpResponse<String> refused = npm.setDistTag("npm", encoded(name), "main", "9.9.9");
+      assertEquals(404, refused.statusCode(), refused.body());
+      assertTrue(
+          NpmClient.parse(refused.body()).path("error").asText().contains("no such version"),
+          refused.body());
+      assertTrue(
+          NpmClient.parse(npm.distTags("npm", encoded(name)).body()).path("main").isMissingNode(),
+          "nothing was written");
+    }
+  }
+
+  @Test
+  void aBareVersionBodyIsAcceptedAlongsideNpmsJsonString() {
+    // npm sends `"1.0.0"` with the quotes; a hand-written `curl --data 1.0.0` sends it without. Both
+    // are unambiguous — a version never starts with a quote — and the curl form is how this endpoint
+    // gets exercised from a shell.
+    String name = scopedName();
+    TinyPackage subject = TinyPackage.of(name, "1.0.0");
+
+    try (NpmClient npm = client()) {
+      npm.publish("npm", encoded(name), subject.publishDocument("latest"));
+      assertEquals(200, npm.distTagBody("npm", encoded(name), "main", "1.0.0").statusCode());
+      assertEquals(
+          "1.0.0",
+          NpmClient.parse(npm.distTags("npm", encoded(name)).body()).path("main").asText());
+
+      HttpResponse<String> empty = npm.distTagBody("npm", encoded(name), "next", "");
+      assertEquals(400, empty.statusCode(), empty.body());
+      HttpResponse<String> notAString = npm.distTagBody("npm", encoded(name), "next", "\"\"");
+      assertEquals(400, notAString.statusCode(), notAString.body());
+    }
+  }
+
+  @Test
+  void bothSpellingsOfAScopedNameReachTheSameTags() {
+    // Same trap as the packument's, on a route where the package name arrives in the MIDDLE of the
+    // path rather than at its end.
+    String name = scopedName();
+    TinyPackage subject = TinyPackage.of(name, "1.0.0");
+
+    try (NpmClient npm = client()) {
+      npm.publish("npm", encoded(name), subject.publishDocument("latest"));
+      assertEquals(200, npm.setDistTag("npm", name, "main", "1.0.0").statusCode(), "decoded PUT");
+      assertEquals(200, npm.distTags("npm", encoded(name)).statusCode(), "encoded GET");
+      assertEquals(
+          npm.distTags("npm", encoded(name)).body(), npm.distTags("npm", name).body());
+    }
+  }
+
+  @Test
+  void theTagsOfAnUnpublishedPackageAreA404AndAProxysAreNotWritable() {
+    try (NpmClient npm = client()) {
+      HttpResponse<String> unknown = npm.distTags("npm", encoded("@qits/never-published"));
+      assertEquals(404, unknown.statusCode(), unknown.body());
+      assertTrue(NpmClient.parse(unknown.body()).has("error"));
+
+      // Refused by TYPE, exactly as a publish is: cached upstream content is not this deployment's
+      // to re-tag.
+      HttpResponse<String> proxy = npm.setDistTag("npmjs", "left-pad", "main", "1.3.0");
+      assertEquals(405, proxy.statusCode(), proxy.body());
+      assertTrue(proxy.body().contains("pull-through"), proxy.body());
+    }
+  }
+
+  @Test
+  void removingATagIsRefusedRatherThanUnknown() {
+    // `npm dist-tag rm` lands on the same 405 unpublish gets, and for a related reason: a tag this
+    // registry served yesterday and does not serve today is a consumer's install breaking. Pinned
+    // because a DELETE route that started 404ing would read as "no such tag" and send someone
+    // looking for the wrong problem.
+    try (NpmClient npm = client()) {
+      HttpResponse<String> refused = npm.delete("npm", "-/package/left-pad/dist-tags/main");
+      assertEquals(405, refused.statusCode(), refused.body());
+      assertEquals("application/json; charset=utf-8", contentType(refused));
+    }
+  }
+
   @Test
   void aTarballThatDoesNotMatchItsClaimedIntegrityIsRefused() {
     // The npm restatement of "a blob that does not hash to its name is not a blob". Both hashes are

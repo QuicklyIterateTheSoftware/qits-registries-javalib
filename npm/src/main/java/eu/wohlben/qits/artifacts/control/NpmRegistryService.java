@@ -139,6 +139,44 @@ public class NpmRegistryService {
   }
 
   /**
+   * Points one dist-tag at one already-published version — {@code npm dist-tag add}.
+   *
+   * <p><b>Why this exists as a route at all, when {@link #publish} already moves tags.</b> A publish
+   * can only name the tags of the version it is publishing, and npm's CLI names exactly one of them,
+   * so a release that wants both {@code latest} and {@code main} on the version it just pushed has
+   * no way to say so: {@code npm publish} claims {@code latest}, {@code npm publish --tag main}
+   * claims {@code main} <em>instead</em>, and a second publish of the same version dies on
+   * immutability. Moving a tag after the fact is the operation npm has for this, and it was the one
+   * thing this registry did not serve.
+   *
+   * <p><b>The version must already exist.</b> A tag naming a version the packument does not contain
+   * is what every npm client reads as a broken package — the same invariant {@link #collect} refuses
+   * a deletion to protect, stated from the other side.
+   *
+   * <p>{@code latest} keeps its ordering rule here, unchanged and for the same reason: the guard
+   * belongs to the tag, not to the route that moves it. See {@link #requireLatestMayMoveTo}.
+   *
+   * @throws NpmException {@code 404} if no such version is published here, {@code 403} if the move
+   *     is a backwards move of {@code latest}
+   */
+  @ActivateRequestContext
+  @Transactional
+  public void setDistTag(String repository, String packageName, String tag, String version) {
+    if (versions.findOne(repository, packageName, version).isEmpty()) {
+      throw new NpmException(
+          404,
+          "cannot point the "
+              + tag
+              + " dist-tag at "
+              + packageName
+              + "@"
+              + version
+              + " — no such version is published here; publish it first");
+    }
+    moveTag(repository, packageName, tag, version);
+  }
+
+  /**
    * Writes one published version and moves the dist-tags that named it.
    *
    * <p>The immutability check lives here rather than in the route because it has to be inside the

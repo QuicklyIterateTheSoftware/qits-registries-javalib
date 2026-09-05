@@ -56,8 +56,32 @@ final class NpmPaths {
   /** {@code <unscoped>-<version>.tgz}; the handler splits it, because it knows the package. */
   private static final String TARBALL_FILE = "(?<file>[A-Za-z0-9][A-Za-z0-9._~+-]{0,255}\\.tgz)";
 
+  /**
+   * A dist-tag name. Deliberately the same shape as one component of a package name, minus the
+   * length: npm has no published grammar for a tag beyond "not a valid semver range", and every tag
+   * anyone actually writes — {@code latest}, {@code main}, {@code next}, {@code v2.x-lts} — fits
+   * this. Anything outside it reaches the catch-all 404 rather than a handler, which is the right
+   * failure for a name this registry would not be able to spell back in a packument.
+   */
+  private static final String TAG = "(?<tag>[A-Za-z0-9][A-Za-z0-9._~-]{0,63})";
+
   static final String PACKUMENT = route(REPOSITORY + "/" + PACKAGE);
   static final String TARBALL = route(REPOSITORY + "/" + PACKAGE + "/-/" + TARBALL_FILE);
+
+  /**
+   * {@code /-/package/<pkg>/dist-tags} — npm's tag surface, which is <b>not</b> under the package's
+   * own path but under the registry-level {@code /-/} namespace, next to {@code /-/v1/search} and
+   * {@code /-/whoami}. That is npm's layout, not a choice available here: {@code npm dist-tag ls}
+   * and {@code npm dist-tag add} dial exactly these two URLs and nothing else.
+   *
+   * <p>Which is also why they cannot collide with {@link #PACKUMENT} or {@link #TARBALL}: a package
+   * name may not begin with {@code -}, so no path starting {@code <repo>/-/} is readable as one.
+   * {@code NpmPathsTest} pins it, in both directions.
+   */
+  static final String DIST_TAGS = route(REPOSITORY + "/-/package/" + PACKAGE + "/dist-tags");
+
+  /** {@link #DIST_TAGS} plus the tag being moved — the {@code npm dist-tag add} target. */
+  static final String DIST_TAG = DIST_TAGS + "/" + TAG;
 
   /**
    * Builds a route regex under {@link #BASE}.

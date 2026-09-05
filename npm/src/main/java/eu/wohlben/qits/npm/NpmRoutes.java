@@ -78,6 +78,13 @@ public class NpmRoutes {
   /** The two schemes a tarball URL can carry; anything else is a malformed forwarding header. */
   private static final Pattern SCHEME = Pattern.compile("https?");
 
+  /**
+   * The body limit on a dist-tag PUT: the whole payload is a JSON string holding a version. Stated
+   * rather than defaulted for the reason the publish limit is — {@code BodyHandler}'s own default is
+   * 10 MiB, which is a strange amount of room for forty characters.
+   */
+  private static final long MAX_DIST_TAG_BODY = 4096;
+
   @Inject NpmRegistryService registry;
   @Inject NpmUpstream upstream;
   @Inject BlobStore blobStore;
@@ -88,10 +95,24 @@ public class NpmRoutes {
   MemorySize maxPublishSize;
 
   void init(@Observes Router router) {
-    // 1. Tarballs first — the more specific of the two shapes. They cannot actually collide (a
+    // 1. Dist-tags first — the most specific shape here, since it carries two literal segments
+    //    (`/-/package/` and `/dist-tags`) that nothing else can produce. Like the tarball/packument
+    //    pair below they cannot actually collide with anything, and they are ordered by specificity
+    //    for the same reason: a future loosening of the name grammar should fail a test rather than
+    //    silently answer with the wrong handler.
+    //
+    //    The PUT buffers, so it needs a BodyHandler — with a limit of its own, because the default
+    //    is 10 MiB and the body here is a JSON string holding a version number. `npm dist-tag rm`
+    //    is not served: a DELETE lands on the 405 below, which is the same refusal unpublish gets.
+    router.getWithRegex(NpmPaths.DIST_TAGS).blockingHandler(guarded("get dist-tags", this::serveDistTags));
+    router
+        .putWithRegex(NpmPaths.DIST_TAG)
+        .handler(BodyHandler.create(false).setBodyLimit(MAX_DIST_TAG_BODY))
+        .blockingHandler(guarded("put dist-tag", this::putDistTag));
+
+    // 2. Tarballs — the more specific of the remaining two shapes. They cannot collide either (a
     //    package name is at most two components and neither may contain a slash, so nothing under
-    //    /-/ can be read as one), but ordering them by specificity means a future loosening of the
-    //    name grammar fails a test rather than silently answering with the wrong handler.
+    //    /-/ can be read as one).
     //
     //    HEAD is NOT derived from GET by Vert.x. It needs its own route or every client that probes
     //    before downloading sees a 404.
@@ -102,7 +123,7 @@ public class NpmRoutes {
         .getWithRegex(NpmPaths.TARBALL)
         .blockingHandler(guarded("get tarball", rc -> serveTarball(rc, true)));
 
-    // 2. Packuments.
+    // 3. Packuments.
     router
         .headWithRegex(NpmPaths.PACKUMENT)
         .blockingHandler(guarded("head packument", rc -> servePackument(rc, false)));
@@ -110,7 +131,7 @@ public class NpmRoutes {
         .getWithRegex(NpmPaths.PACKUMENT)
         .blockingHandler(guarded("get packument", rc -> servePackument(rc, true)));
 
-    // 3. Publish. The one route that buffers, and the reason it needs a STATED limit: BodyHandler
+    // 4. Publish. The big buffering route, and the reason it needs a STATED limit: BodyHandler
     //    defaults to 10 MiB (vertx-web's own default, the bug the git host's max-pack-size exists
     //    for), and the publish document carries the tarball base64-inflated by 4/3 inside JSON.
     //    Sized well under quarkus.http.limits.max-body-size so the application's 413 wins the race
@@ -120,9 +141,11 @@ public class NpmRoutes {
         .handler(BodyHandler.create(false).setBodyLimit(maxPublishSize.asLongValue()))
         .blockingHandler(guarded("publish", this::publish));
 
-    // 4. DELETE is deliberately unimplemented, exactly as on /v2: there is no garbage collection and
+    // 5. DELETE is deliberately unimplemented, exactly as on /v2: there is no garbage collection and
     //    nothing should come to depend on unpublish semantics before they exist. 405 rather than
     //    404, which would read as "unknown package" and send a client looking for the wrong problem.
+    //    `npm dist-tag rm` lands here too, and gets the same answer for a related reason: a tag this
+    //    registry served yesterday and does not serve today is a consumer's install breaking.
     router
         .route(HttpMethod.DELETE, NpmPaths.BASE + "/*")
         .handler(
@@ -130,7 +153,7 @@ public class NpmRoutes {
                 NpmErrors.send(
                     rc, 405, "this registry does not implement unpublish"));
 
-    // 5. Everything else under the base — /-/v1/search, /-/npm/v1/security/audits, /-/whoami, the
+    // 6. Everything else under the base — /-/v1/search, /-/npm/v1/security/audits, /-/whoami, the
     //    login handshake — is a JSON 404, never Vert.x' default HTML page. npm degrades gracefully
     //    on all of them: a search 404s to "no results", an audit 404s to "not audited", and an
     //    install proceeds. That is why they are absent rather than stubbed.
@@ -185,6 +208,125 @@ public class NpmRoutes {
       return;
     }
     response.end(Buffer.buffer(body));
+  }
+
+  // --- dist-tags --------------------------------------------------------------------------------
+
+  /**
+   * {@code GET /artifacts/npm/<repo>/-/package/<pkg>/dist-tags} — what {@code npm dist-tag ls}
+   * reads.
+   *
+   * <p>The body is the bare {@code {tag: version}} map, not an envelope: that is what npm parses,
+   * and it is the same map the packument carries under {@code dist-tags}.
+   *
+   * <p><b>A proxy answers from upstream's document</b> rather than from this database. Tag rows are
+   * written by publishes, and a pull-through cache has none — answering {@code {}} would say "this
+   * package has no tags" about a package that does, which is worse than not serving the route. The
+   * packument handler already resolves a proxied package this way; this is the same call.
+   */
+  private void serveDistTags(RoutingContext rc) {
+    String repository = rc.pathParam("repository");
+    String type = registry.requireNpmRepository(repository);
+    NpmPackageName pkg = packageOf(rc);
+
+    Map<String, String> tags = new LinkedHashMap<>();
+    if (NpmProxyProfile.KEY.equals(type)) {
+      JsonNode declared = upstream.packument(repository, pkg).path("dist-tags");
+      for (Map.Entry<String, JsonNode> entry : declared.properties()) {
+        tags.put(entry.getKey(), entry.getValue().asText());
+      }
+    } else {
+      if (registry.listVersions(repository, pkg.full()).isEmpty()) {
+        // Same 404 the packument gives, and for the same reason: npm reads it as "not published
+        // yet" and proceeds, which is what a first publish needs it to do.
+        throw new NpmException(404, "no such package: " + pkg.full());
+      }
+      tags.putAll(registry.distTags(repository, pkg.full()));
+    }
+
+    sendTags(rc, tags);
+  }
+
+  /**
+   * {@code PUT /artifacts/npm/<repo>/-/package/<pkg>/dist-tags/<tag>} — {@code npm dist-tag add}.
+   *
+   * <p>The one operation that moves a tag without publishing anything, and the reason it had to
+   * exist: {@code npm publish} names exactly one tag, so a release that wants its version under both
+   * {@code latest} and {@code main} cannot say so in the publish document, and cannot publish twice.
+   *
+   * <p>Refused on a proxy by TYPE, with the same message shape publish uses and the same reason:
+   * cached upstream content is not this deployment's to re-tag.
+   *
+   * <p>The answer is the package's full tag map, which makes a {@code curl} of this endpoint
+   * self-verifying. npm itself reads only the status.
+   */
+  private void putDistTag(RoutingContext rc) {
+    String repository = rc.pathParam("repository");
+    String type = registry.requireNpmRepository(repository);
+    if (!NpmPackagesProfile.KEY.equals(type)) {
+      throw new NpmException(
+          405,
+          "'"
+              + repository
+              + "' is a pull-through cache of an upstream registry and its dist-tags are upstream's;"
+              + " re-tag in a npm-packages repository instead");
+    }
+    NpmPackageName pkg = packageOf(rc);
+    String tag = rc.pathParam("tag");
+
+    registry.setDistTag(repository, pkg.full(), tag, versionOf(rc, pkg, tag));
+
+    sendTags(rc, registry.distTags(repository, pkg.full()));
+  }
+
+  /**
+   * The {@code {tag: version}} body both dist-tag routes answer with.
+   *
+   * <p>Assembled entry by entry rather than through {@code new JsonObject(map)}: that constructor
+   * takes a {@code Map<String, Object>}, which a {@code Map<String, String>} is not, and the cast
+   * that would make it compile is the kind that hides a real type error later.
+   */
+  private static void sendTags(RoutingContext rc, Map<String, String> tags) {
+    JsonObject body = new JsonObject();
+    tags.forEach(body::put);
+    rc.response()
+        .putHeader(HttpHeaders.CONTENT_TYPE, "application/json; charset=utf-8")
+        .end(body.encode());
+  }
+
+  /**
+   * The version out of a dist-tag PUT body.
+   *
+   * <p>npm sends the version as a <b>JSON string</b> — the body of {@code npm dist-tag add pkg@1.2.3
+   * main} is the five bytes {@code "1.2.3"}, quotes included. A bare unquoted version is accepted
+   * too, because that is what a hand-written {@code curl --data} sends and there is no ambiguity
+   * between the two: a version never starts with a quote.
+   */
+  private String versionOf(RoutingContext rc, NpmPackageName pkg, String tag) {
+    Buffer buffer = rc.body() == null ? null : rc.body().buffer();
+    String raw = buffer == null ? "" : buffer.toString(StandardCharsets.UTF_8).trim();
+    if (raw.isEmpty()) {
+      throw new NpmException(
+          400, "no version in the body of the " + tag + " dist-tag PUT for " + pkg.full());
+    }
+    if (raw.startsWith("\"")) {
+      try {
+        JsonNode parsed = json.readTree(raw);
+        if (parsed != null && parsed.isTextual() && !parsed.asText().isBlank()) {
+          return parsed.asText().trim();
+        }
+      } catch (Exception unparseable) {
+        // Falls through to the same message an empty body gets: what arrived is not a version.
+      }
+      throw new NpmException(
+          400,
+          "the body of the "
+              + tag
+              + " dist-tag PUT for "
+              + pkg.full()
+              + " is not a JSON string naming a version");
+    }
+    return raw;
   }
 
   // --- tarballs ---------------------------------------------------------------------------------

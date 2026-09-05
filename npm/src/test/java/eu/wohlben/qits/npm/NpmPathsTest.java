@@ -78,6 +78,58 @@ class NpmPathsTest {
     assertFalse(matches(NpmPaths.PACKUMENT, "/artifacts/npm/npm/left-pad/1.3.0"));
   }
 
+  // --- dist-tags --------------------------------------------------------------------------------
+
+  @Test
+  void aDistTagPathSplitsIntoRepositoryPackageAndTag() {
+    // npm puts the tag surface under the registry-level /-/ namespace, not under the package's own
+    // path — so this is the one route whose package name arrives in the MIDDLE of the path, and the
+    // %2f spelling still has to survive it.
+    String encoded = "/artifacts/npm/npm/-/package/@qits%2fangular/dist-tags/main";
+    assertEquals("npm", group(NpmPaths.DIST_TAG, encoded, "repository"));
+    assertEquals("@qits%2fangular", group(NpmPaths.DIST_TAG, encoded, "pkg"));
+    assertEquals("main", group(NpmPaths.DIST_TAG, encoded, "tag"));
+
+    String decoded = "/artifacts/npm/npm/-/package/@qits/angular/dist-tags/latest";
+    assertEquals("@qits/angular", group(NpmPaths.DIST_TAG, decoded, "pkg"));
+    assertEquals("latest", group(NpmPaths.DIST_TAG, decoded, "tag"));
+
+    String unscoped = "/artifacts/npm/npm/-/package/left-pad/dist-tags";
+    assertEquals("left-pad", group(NpmPaths.DIST_TAGS, unscoped, "pkg"));
+    assertEquals("@qits%2Fangular", pkg(NpmPaths.DIST_TAGS,
+        "/artifacts/npm/npm/-/package/@qits%2Fangular/dist-tags"));
+  }
+
+  @Test
+  void theDistTagRoutesOverlapNothingInEitherDirection() {
+    // The load-bearing claim of the whole addition: a package name may not begin with `-`, so no
+    // path starting <repo>/-/ can be read as a package or a tarball, and no package or tarball path
+    // carries the two literal segments these need. Both directions, because "they cannot collide"
+    // is a statement about four regexes and only two of them are new.
+    String tags = "/artifacts/npm/npm/-/package/@qits%2fangular/dist-tags";
+    String tag = tags + "/main";
+    assertFalse(matches(NpmPaths.PACKUMENT, tags));
+    assertFalse(matches(NpmPaths.PACKUMENT, tag));
+    assertFalse(matches(NpmPaths.TARBALL, tags));
+    assertFalse(matches(NpmPaths.TARBALL, tag));
+
+    assertFalse(matches(NpmPaths.DIST_TAGS, "/artifacts/npm/npm/@qits%2fangular"));
+    assertFalse(matches(NpmPaths.DIST_TAG, "/artifacts/npm/npm/@qits%2fangular"));
+    assertFalse(
+        matches(NpmPaths.DIST_TAGS, "/artifacts/npm/npm/@qits/angular/-/angular-1.0.0.tgz"));
+    assertFalse(matches(NpmPaths.DIST_TAGS, "/artifacts/npm/npmjs/-/v1/search?text=x"));
+    assertFalse(matches(NpmPaths.DIST_TAGS, "/artifacts/npm/npmjs/-/whoami"));
+
+    // The two dist-tag routes do not overlap each other either: the list has no tag segment and the
+    // move has exactly one, so a trailing slash or a second segment reaches neither.
+    assertFalse(matches(NpmPaths.DIST_TAGS, tag));
+    assertFalse(matches(NpmPaths.DIST_TAG, tags));
+    assertFalse(matches(NpmPaths.DIST_TAG, tags + "/"));
+    assertFalse(matches(NpmPaths.DIST_TAG, tags + "/main/extra"));
+    // And a tag outside the grammar reaches the catch-all rather than a handler.
+    assertFalse(matches(NpmPaths.DIST_TAG, tags + "/-leading-dash"));
+  }
+
   @Test
   void theProtocolSideEndpointsMissBothRoutesAndReachTheCatchAll() {
     // Search, audit, whoami, login. npm degrades gracefully on a 404 for every one of them, which
@@ -109,6 +161,8 @@ class NpmPathsTest {
     // groups is the cheapest possible guard.
     assertGroupsAllNamed(NpmPaths.PACKUMENT, 2);
     assertGroupsAllNamed(NpmPaths.TARBALL, 3);
+    assertGroupsAllNamed(NpmPaths.DIST_TAGS, 2);
+    assertGroupsAllNamed(NpmPaths.DIST_TAG, 3);
   }
 
   private static void assertGroupsAllNamed(String regex, int expectedNamed) {
