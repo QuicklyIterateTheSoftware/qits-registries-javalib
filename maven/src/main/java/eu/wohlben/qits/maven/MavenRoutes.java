@@ -92,6 +92,9 @@ public class MavenRoutes {
   @Inject BlobStore blobStore;
   @Inject BlobSender blobSender;
 
+  /** How many times one cached path may be thrown away and pulled through again. */
+  @Inject MavenProxyHealing heals;
+
   /**
    * The one size answer for both directions a jar can travel, the npm {@code max-publish-size}
    * precedent: how large an artifact is this deployment willing to hold. Jars are megabytes at
@@ -241,11 +244,57 @@ public class MavenRoutes {
       return;
     }
 
-    MavenRegistryService.StoredArtifact stored =
-        registry
-            .findArtifact(repository, path)
-            .orElseGet(() -> upstream.fetchArtifact(repository, path));
-    serveStored(rc, repository, path, stored, withBody);
+    MavenRegistryService.StoredArtifact cached =
+        registry.findArtifact(repository, path).orElse(null);
+    boolean healing = false;
+    if (cached != null) {
+      try {
+        // The budget is consulted HERE, before anything is thrown away. Spent, `healable` is false
+        // and the fault escapes as itself — a 500 carrying the real cause, which is the honest
+        // answer once re-fetching has been shown not to help. See MavenProxyHealing.
+        serveStored(rc, repository, path, cached, withBody, heals.mayHeal(repository, path));
+        heals.healed(repository, path);
+        return;
+      } catch (UnservableEntry broken) {
+        // Fall through to the fetch. Everything that made this recoverable happened in
+        // serveStored's preamble, BEFORE a byte of the response was written — see below.
+        evict(repository, path, broken);
+        healing = true;
+      }
+    }
+    try {
+      serveStored(rc, repository, path, upstream.fetchArtifact(repository, path), withBody, false);
+    } catch (RuntimeException stillBroken) {
+      if (healing) {
+        // The entry was thrown away and pulling it through again did not fix it. That is the fact
+        // the budget is counting; without this line the next request would evict and refetch on the
+        // same reasoning, forever, and the cache would be an amplifier rather than a cache.
+        heals.healingFailed(repository, path);
+      }
+      throw stillBroken;
+    }
+    if (healing) {
+      heals.healed(repository, path);
+    }
+  }
+
+  /**
+   * Drops a cached entry that could not be served, so the fetch that follows can replace it.
+   *
+   * <p>Logged at WARN whatever happens: a cache throwing its own content away is not routine, and
+   * the count is the part worth reading — {@code maven_artifact}'s primary key is {@code
+   * (repository, path)}, so <b>two</b> rows removed for one path says the key had stopped holding,
+   * which is a different incident from a blob that went missing.
+   */
+  private void evict(String repository, String path, UnservableEntry broken) {
+    long removed = registry.dropUnservableCachedFile(repository, path);
+    LOG.warnf(
+        broken.getCause(),
+        "maven proxy: evicting the cached %s in '%s' (%d row(s)) and fetching it again — it could"
+            + " not be served",
+        path,
+        repository,
+        removed);
   }
 
   /**
@@ -369,7 +418,10 @@ public class MavenRoutes {
         registry
             .findArtifact(repository, path)
             .orElseThrow(() -> new MavenException(404, "no such artifact: " + path));
-    serveStored(rc, repository, path, stored, withBody);
+    // healable=false, and it is the type that makes it so rather than a caller's preference: a
+    // hosted repository has no upstream to fetch from, so there is nothing an eviction could
+    // achieve here except deleting a published jar.
+    serveStored(rc, repository, path, stored, withBody, false);
   }
 
   /**
@@ -389,11 +441,23 @@ public class MavenRoutes {
       String repository,
       String path,
       MavenRegistryService.StoredArtifact stored,
-      boolean withBody) {
+      boolean withBody,
+      boolean healable) {
+
+    // EVERYTHING THAT CAN FAIL RECOVERABLY HAPPENS HERE, BEFORE THE RESPONSE IS TOUCHED. That is
+    // what makes healing inside the same request possible at all: past this preamble the head is
+    // written and the only honest thing left to do with a failure is close the connection.
     long size;
     try {
       size = blobStore.size(stored.blobId());
     } catch (Exception missing) {
+      // A cached row whose blob is gone is REPAIRABLE — a proxy has somewhere to ask — while the
+      // same row in a hosted repository is a 404, because there the bytes were ours and are simply
+      // lost. Same fact, two honest answers, told apart by the repository's type and never by a
+      // path.
+      if (healable) {
+        throw new UnservableEntry(path, missing);
+      }
       throw new MavenException(404, "the bytes of " + path + " are not stored");
     }
 
@@ -405,7 +469,24 @@ public class MavenRoutes {
     // created it counts as its first access, and this is the column the cache eviction window is
     // measured against — so an untracked read here would be a dependency the collector thinks
     // nothing resolves.
-    registry.touchArtifact(repository, path);
+    //
+    // AND IT IS A WRITE ON THE READ PATH, which is what made it the thing that broke. On 2026-09-05
+    // this bulk UPDATE raised `duplicate key value violates unique constraint "maven_artifact_pkey"`
+    // for one cached pom — an UPDATE that touches no key column, so the primary key had stopped
+    // agreeing with the heap — and because nothing here caught it, a perfectly serveable artifact
+    // answered 500 to every request for four days. An access timestamp is bookkeeping; it must never
+    // be the reason a client cannot have its bytes.
+    try {
+      registry.touchArtifact(repository, path);
+    } catch (RuntimeException bookkeeping) {
+      if (healable) {
+        throw new UnservableEntry(path, bookkeeping);
+      }
+      // Hosted, so there is nothing to heal — but the answer is still not a 404. "I could not ask"
+      // and "there is no such thing" are different answers and must not share a status: a wrong
+      // absence is cached by every maven client that hears it.
+      throw bookkeeping;
+    }
 
     HttpServerResponse response =
         rc.response()
@@ -593,5 +674,21 @@ public class MavenRoutes {
         MavenErrors.fail(rc, what, thrown);
       }
     };
+  }
+
+  /**
+   * A cached entry that could not be served for a reason a fresh copy would fix — <b>raised only
+   * from before the response head is written, and only for a {@code maven-proxy}</b>.
+   *
+   * <p>A type of its own rather than a status, because it is not an answer to the client at all: it
+   * is a signal to the one line in {@link #serveProxied} that can act on it. Nothing outside this
+   * class can see it, and it never reaches {@link MavenErrors} — an escape would be a 500 with a
+   * message about the cache's internals, which is precisely the shroud this release is removing.
+   */
+  private static final class UnservableEntry extends RuntimeException {
+
+    UnservableEntry(String path, Throwable cause) {
+      super("the cached " + path + " could not be served", cause);
+    }
   }
 }

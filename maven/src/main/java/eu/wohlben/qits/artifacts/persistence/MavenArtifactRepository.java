@@ -16,6 +16,70 @@ public class MavenArtifactRepository implements PanacheRepositoryBase<MavenArtif
     return findByIdOptional(new MavenArtifactId(repository, path));
   }
 
+  /**
+   * Writes one pulled-through file and <b>lets the primary key be the thing that decides</b> whether
+   * it was already there.
+   *
+   * <p>The flush is the whole method. Without it the insert is queued until the transaction commits,
+   * which is somebody else's stack frame, and a duplicate arrives there as a rollback nobody local
+   * can interpret — the caller needs the violation <em>here</em>, where "that path is already
+   * recorded" is a known and harmless outcome. See {@code
+   * MavenRegistryService.recordProxiedArtifact}, which runs this in a transaction of its own for
+   * exactly that reason.
+   *
+   * <p>This replaced a {@code findOne(...).isPresent()} guard in front of a {@code persist}, and the
+   * difference is not style. Two builds resolving the same new dependency at the same moment is the
+   * NORMAL case for a pull-through cache, not the edge — one {@code mvn -T} run does it to itself —
+   * and both requests read "absent" before either wrote. What follows is one insert that lands and
+   * one that raises {@code duplicate key value violates unique constraint "maven_artifact_pkey"}.
+   *
+   * <p><b>On 2026-09-05 that was worse than a failed write.</b> A {@code
+   * quarkus-proxy-registry-3.34.6.pom} cached during exactly such a race came out of it with the
+   * table holding more than one heap tuple for its key, and from then on the access-tracking {@code
+   * UPDATE} that every read performs — which touches no key column, so it cannot violate a primary
+   * key unless the index has stopped agreeing with the heap — raised that same violation on every
+   * single request. The coordinate answered 500 for four days and blocked release gates across the
+   * platform. The race is what put it there, so the race is what this closes.
+   *
+   * <p>Deliberately NOT {@code insert … on conflict do nothing}, which would say this in one
+   * statement and no exception: this module's own suite runs its entity tables on H2 (only the blob
+   * tables get a real postgres, because only they need one), and a repository that could not be
+   * tested on the engine the suite uses would be worse than an exception on a path that is taken
+   * once in a thousand pulls.
+   *
+   * @throws jakarta.persistence.PersistenceException the path is already recorded — the caller's to
+   *     recognise and absorb
+   */
+  public void store(
+      String repository, String path, String blobId, long sizeBytes, Instant createdAt) {
+    MavenArtifact row = new MavenArtifact();
+    row.repository = repository;
+    row.path = path;
+    row.blobId = blobId;
+    row.sizeBytes = sizeBytes;
+    row.createdAt = createdAt;
+    persist(row);
+    flush();
+  }
+
+  /**
+   * Removes <b>every</b> row at one path, and says how many there were.
+   *
+   * <p>The twin of {@code findOne(...)} + {@code delete(entity)}, and it exists because that pair
+   * cannot clear the fault this cache actually suffered. A load returns one tuple or none; if the
+   * primary key has stopped holding — which is what a {@code duplicate key} error on a non-key
+   * {@code UPDATE} means — deleting the entity a load returned leaves the other tuple exactly where
+   * it was, and the caller is told it succeeded. A bulk delete on the same predicate takes all of
+   * them.
+   *
+   * <p>The count is returned rather than swallowed: more than one row for one primary key is a fact
+   * about the store that whoever is reading the log needs, and it is the difference between "this
+   * entry was cold" and "this entry was corrupt".
+   */
+  public long deleteEveryRowAt(String repository, String path) {
+    return delete("repository = ?1 and path = ?2", repository, path);
+  }
+
   /** Every path a repository holds, lexically — the enumeration a GC report lists identities from. */
   public List<String> listPaths(String repository) {
     return getEntityManager()

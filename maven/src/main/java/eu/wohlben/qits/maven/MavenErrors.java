@@ -25,6 +25,22 @@ final class MavenErrors {
 
   private MavenErrors() {}
 
+  /** How much of an unexpected failure a client is told: the type, its message, one line, clipped. */
+  private static final int CAUSE_LIMIT = 400;
+
+  /**
+   * The one-line account of an unexpected throwable. Newlines are folded so the answer stays one
+   * line in a resolver's output, and the whole thing is clipped so a driver that puts a query into
+   * its message cannot make the body the size of the artifact.
+   */
+  private static String describe(Throwable thrown) {
+    String message = thrown.getMessage();
+    String line =
+        thrown.getClass().getSimpleName()
+            + (message == null || message.isBlank() ? "" : ": " + message.replaceAll("\\s+", " "));
+    return line.length() <= CAUSE_LIMIT ? line : line.substring(0, CAUSE_LIMIT) + "…";
+  }
+
   static void send(RoutingContext rc, int status, String message) {
     // A response may already be on its way: a client that hung up mid-deploy leaves nothing to
     // answer. Writing again throws IllegalStateException and buries the real cause.
@@ -54,7 +70,19 @@ final class MavenErrors {
       }
       default -> {
         LOG.errorf(thrown, "maven: %s", what);
-        send(rc, 500, "internal maven repository error");
+        // THE BODY CARRIES THE CAUSE, and that is a change made for a reason. This used to answer a
+        // flat "internal maven repository error" — 31 bytes that say only "something", which is
+        // exactly as much as a bare 500 already said. On 2026-09-05 one cached pom answered that
+        // string to every request for four days, and nobody could tell from the wire whether the
+        // fault was the blob store, the upstream or the row; it took the service's own log to learn
+        // it was `duplicate key value violates unique constraint "maven_artifact_pkey"` on the
+        // access-tracking UPDATE. The client is a maven resolver, which prints this line into a
+        // failing build's output — the one place somebody is already looking.
+        //
+        // Bounded and shaped, because it is still an internal fault reaching a client: the exception
+        // TYPE and its message, on one line, clipped. No stack, which belongs in the log beside it,
+        // and no chain, which is where connection strings tend to live.
+        send(rc, 500, "internal maven repository error: " + describe(thrown));
       }
     }
   }

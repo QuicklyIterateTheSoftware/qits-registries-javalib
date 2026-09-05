@@ -27,6 +27,31 @@ type, so splitting them would cut every format down the middle.
 
 `blobstore` is first in the reactor: every other module writes through it.
 
+### A pull-through cache holds nothing it cannot get again
+
+Which is why, since 2026-09-05, the **maven** proxy repairs itself: a cached entry whose serve
+fails on a storage-side fault — before a byte of the response is written — is evicted and pulled
+through again inside the same request, bounded to a few attempts per path so a fault that
+re-fetching does not fix becomes an honest error instead of a loop (`MavenProxyHealing`). A
+**hosted** repository never does this and must not: there is no upstream to ask, so an eviction
+there could only delete a jar this platform published. The decision is the repository's type and
+nothing else.
+
+It is written from an incident. A cached `quarkus-proxy-registry-3.34.6.pom` answered `500` to
+every request for four days while its bytes, its upstream and its neighbours were all fine: the
+access-tracking `UPDATE` that every read performs raised `duplicate key value violates unique
+constraint "maven_artifact_pkey"` — an `UPDATE` that touches no key column, so the primary key had
+stopped agreeing with the heap. The row got into that state through `recordProxiedArtifact`'s
+check-then-insert, which is a race, and which two builds resolving one new dependency together
+walk into as a matter of course. Both halves are fixed here: the write lets the key decide, and the
+read no longer keeps an entry it cannot serve.
+
+**`NpmRegistryService.recordProxiedVersion` and `OciRegistryService.recordMirrorTagCheck` still
+carry the identical shape** — `findOne(...).isPresent()` guarding a `persist` — and are the obvious
+next repair. They are deliberately not in this change: the maven one is the fault that was measured,
+and each of the other two needs its own fixture to prove the concurrent write is a quiet no-op
+rather than a rollback.
+
 ## Coordinates
 
 `eu.wohlben.qits:<artifactId>`. **`qits-blobstore` keeps the coordinate it always had** — not

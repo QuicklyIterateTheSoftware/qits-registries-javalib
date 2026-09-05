@@ -9,10 +9,12 @@ import eu.wohlben.qits.blobstore.persistence.ArtifactRepositoryRepository;
 import eu.wohlben.qits.artifacts.persistence.MavenArtifactRepository;
 import eu.wohlben.qits.artifacts.persistence.MavenProxyMetadataRepository;
 import eu.wohlben.qits.db.DbRetry;
+import io.quarkus.narayana.jta.QuarkusTransaction;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.context.control.ActivateRequestContext;
 import jakarta.inject.Inject;
 import jakarta.transaction.Transactional;
+import java.sql.SQLException;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
@@ -33,6 +35,9 @@ import java.util.Optional;
  */
 @ApplicationScoped
 public class MavenRegistryService {
+
+  private static final org.jboss.logging.Logger LOG =
+      org.jboss.logging.Logger.getLogger(MavenRegistryService.class);
 
   @Inject ArtifactRepositoryRepository repositories;
   @Inject MavenArtifactRepository artifacts;
@@ -232,19 +237,84 @@ public class MavenRegistryService {
    * is ours to guarantee, and a path re-fetched after eviction must be able to land again.
    */
   @ActivateRequestContext
-  @Transactional
   public void recordProxiedArtifact(
       String repository, String path, String blobId, long sizeBytes) {
-    if (artifacts.findOne(repository, path).isPresent()) {
-      return;
+    // THE PRIMARY KEY DECIDES, not a read this method did a moment earlier. The old shape asked
+    // findOne and then persisted if the answer was "absent", which leaves a window between the two
+    // halves — and the paragraph above, about two concurrent builds resolving one dependency being
+    // the normal case rather than the edge, is precisely the traffic that lands in it. See
+    // MavenArtifactRepository.store for what that race cost on 2026-09-05.
+    //
+    // A TRANSACTION OF ITS OWN, which is the load-bearing half. A failed insert dooms the
+    // transaction it ran in, so absorbing the duplicate inside a caller's transaction would leave
+    // that caller committed to a rollback it never asked for. Here the doomed transaction is this
+    // one, it is the last thing it was going to do, and its failure means the row is there — which
+    // is the outcome the caller wanted.
+    try {
+      QuarkusTransaction.requiringNew()
+          .run(() -> artifacts.store(repository, path, blobId, sizeBytes, Instant.now()));
+    } catch (RuntimeException raced) {
+      if (!isDuplicateKey(raced)) {
+        throw raced;
+      }
+      // Somebody else pulled the same coordinate through first. That is the idempotent outcome this
+      // method promises, and it is a debug line rather than a warning: on a cache serving parallel
+      // builds it is ordinary traffic, not an incident.
+      LOG.debugf("maven proxy: %s in '%s' was recorded by a concurrent pull", path, repository);
     }
-    MavenArtifact row = new MavenArtifact();
-    row.repository = repository;
-    row.path = path;
-    row.blobId = blobId;
-    row.sizeBytes = sizeBytes;
-    row.createdAt = Instant.now();
-    artifacts.persist(row);
+  }
+
+  /**
+   * Whether a failure is "that row is already there" and nothing else.
+   *
+   * <p>Read off the SQLSTATE rather than off an exception type, because the type depends on the
+   * dialect while {@code 23505} (and {@code 23000}, which older drivers report for the same thing)
+   * is what the standard says a unique violation is. Anything else — a dead connection, a column
+   * that does not fit — is not this method's to absorb and is rethrown, because a cache that
+   * silently swallowed a failed write would go on serving misses forever with nothing to say why.
+   */
+  private static boolean isDuplicateKey(Throwable thrown) {
+    for (Throwable cause = thrown; cause != null; cause = cause.getCause()) {
+      if (cause instanceof SQLException sql
+          && ("23505".equals(sql.getSQLState()) || "23000".equals(sql.getSQLState()))) {
+        return true;
+      }
+      if (cause.getCause() == cause) {
+        return false;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Throws away a cached file that could not be served, so the request that found it broken can pull
+   * it through again.
+   *
+   * <p><b>The self-heal's door, and deliberately not {@link #evictProxiedArtifact}'s.</b> The two
+   * differ in what they can be trusted to assume. The sweep's door works from a plan it built by
+   * enumerating rows, so loading one back and deleting the entity is right there. This one is
+   * reached because a row would not serve — which means a load is the very thing that cannot be
+   * relied on. It deletes on the predicate and reports how many rows went; more than one is the fault
+   * itself, since the table's primary key is {@code (repository, path)}.
+   *
+   * <p><b>The type is checked, not assumed</b>, for {@link #evictProxiedArtifact}'s reason and more
+   * sharply: one table holds both maven types, and a self-heal that fired on a hosted repository
+   * would silently delete a jar this platform published because its blob happened to be unreadable
+   * for a second. A hosted miss has a 404 and no upstream to ask; there is nothing to heal and
+   * nothing may be removed. So this refuses anything that is not a {@code maven-proxy} — and
+   * refuses by returning <b>zero</b> rather than by throwing, because the caller is a route already
+   * handling a failure and a second exception on top of the first buries the one worth reading.
+   *
+   * @return how many rows were removed; {@code 0} means nothing was dropped, for any reason
+   */
+  @ActivateRequestContext
+  @Transactional
+  public long dropUnservableCachedFile(String repository, String path) {
+    ArtifactRepository row = repository == null ? null : repositories.findById(repository);
+    if (row == null || !MavenProxyProfile.KEY.equals(row.type)) {
+      return 0;
+    }
+    return artifacts.deleteEveryRowAt(repository, path);
   }
 
   @ActivateRequestContext
