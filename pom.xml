@@ -36,7 +36,7 @@
     <!-- One version for the whole byte plane. Every module carries it verbatim — this repository
          duplicates the version rather than deriving it, so the release stamp rewrites one literal
          per pom — and `deploy` at the root publishes them together. -->
-    <version>2026.904.82651</version>
+    <version>2026.905.34248</version>
     <packaging>pom</packaging>
     <name>qits-registries</name>
 
