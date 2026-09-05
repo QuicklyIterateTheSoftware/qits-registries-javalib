@@ -189,8 +189,32 @@ public class NpmRegistryService {
    * <p>Immutability is checked <b>twice</b>, against the row and against the tombstone, because
    * garbage collection makes "there is no row" mean two different things. See {@link #collect}.
    *
-   * @throws NpmException {@code 403} if the version already exists, if it was collected, or if the
-   *     publish would move {@code latest} to a version sorting below the one it names
+   * <p><b>A tombstoned version may be RESTORED with the bytes it had, and only with those.</b> The
+   * tombstone protects exactly one property — a coordinate must never come to mean different bytes
+   * than it once did — and a republish carrying the <em>same</em> tarball cannot violate it. Blob
+   * ids are content addresses, so "the same bytes" is a string comparison against the id the
+   * tombstone already records, and no new state is needed to decide it.
+   *
+   * <p>That door exists because a version can now leave this registry by accident. Collection used
+   * to be the considered removal of something nobody wanted; on 2026-09-05 the retention rules took
+   * versions that fifteen lockfiles pinned, and the refusal below turned a recoverable loss into a
+   * permanent one — every consumer of a swept version had to be edited, on the strength of a
+   * guarantee that an identical republish does not weaken. {@code npm pack} is reproducible by
+   * design (pacote normalises mtime, uid and gid), so repacking a source tag reproduces the
+   * published tarball byte for byte: measured that day, tag {@code 2026.904.202810} of
+   * {@code @qits/ui-components} repacked to {@code sha512-wzvGnd50Na6…}, the exact integrity fifteen
+   * frontend lockfiles carried.
+   *
+   * <p><b>Restoring clears the tombstone</b>, in this transaction, because the version is live again
+   * and a live row beside a stone saying it was collected is two answers to one question — and the
+   * next {@link #collect} would try to write a second stone over the first.
+   *
+   * <p>A tombstone with <b>no</b> recorded blob id refuses every republish, as before: the field is
+   * nullable, and "I cannot tell which bytes these were" is not evidence that these are them.
+   *
+   * @throws NpmException {@code 403} if the version already exists, if it was collected and the
+   *     publish carries different bytes, or if the publish would move {@code latest} to a version
+   *     sorting below the one it names
    */
   @ActivateRequestContext
   @Transactional
@@ -215,10 +239,18 @@ public class NpmRegistryService {
     // A collected version has no row, so the check above would wave it through as a fresh publish.
     // Its own message matters as much as its refusal: "immutable" would send a pusher looking for a
     // version they can see, and there is nothing to see.
+    //
+    // Unless the bytes are the ones that were collected — then this is a RESTORE, and the stone is
+    // cleared rather than enforced. See the javadoc for why an identical republish weakens nothing.
     tombstones
         .findOne(repository, packageName, version)
         .ifPresent(
             collected -> {
+              if (collected.tarballBlobId != null
+                  && collected.tarballBlobId.equals(tarballBlobId)) {
+                tombstones.delete(collected);
+                return;
+              }
               throw new NpmException(
                   403,
                   "cannot publish "
@@ -228,8 +260,11 @@ public class NpmRegistryService {
                       + " — that version was published here and later removed by garbage collection"
                       + " on "
                       + collected.collectedAt
-                      + "; a version name is never reused, even after its bytes are gone. Bump the"
-                      + " version");
+                      + (collected.tarballBlobId == null
+                          ? "; the bytes it held were not recorded, so nothing can be shown to be a"
+                              + " restore of them. Bump the version"
+                          : "; a name may be restored with the bytes it had and with no others, and"
+                              + " these are different bytes. Bump the version"));
             });
     versions.persist(
         row(repository, packageName, version, tarballBlobId, integrity, shasum, manifestJson));

@@ -4,12 +4,15 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import eu.wohlben.qits.artifacts.entity.NpmVersionTombstone;
 import eu.wohlben.qits.artifacts.error.NpmException;
+import eu.wohlben.qits.artifacts.persistence.NpmVersionTombstoneRepository;
 import eu.wohlben.qits.blobstore.control.ArtifactRepositoryService;
 import eu.wohlben.qits.blobstore.control.CiScreenshotsProfile;
 import eu.wohlben.qits.blobstore.control.RepositoryTypeProfiles;
 import eu.wohlben.qits.blobstore.entity.RepositoryTypeProfile;
 import eu.wohlben.qits.blobstore.error.BadRequestException;
+import io.quarkus.narayana.jta.QuarkusTransaction;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import java.time.Instant;
@@ -32,6 +35,16 @@ class NpmRegistryStorageTest extends ArtifactsTestSupport {
   @Inject NpmRegistryService npm;
 
   @Inject RepositoryTypeProfiles repositoryTypes;
+
+  @Inject NpmVersionTombstoneRepository tombstones;
+
+  /**
+   * Drops the shared session's first-level cache so the next read reaches the database — which is
+   * what a new request gets for free in production and what this suite has to ask for.
+   */
+  private void freshSession() {
+    tombstones.getEntityManager().clear();
+  }
 
   @Test
   void bothNpmTypesAreEnsuredLikeAnyOtherAndStayImmutable() {
@@ -125,11 +138,15 @@ class NpmRegistryStorageTest extends ArtifactsTestSupport {
   }
 
   @Test
-  void aCollectedVersionKeepsItsNameForeverAndSaysSoRatherThanClaimingImmutability() {
+  void aCollectedVersionRefusesDifferentBytesForeverAndSaysSoRatherThanClaimingImmutability() {
     // What the tombstone is for. Immutability is enforced by looking for the row, so deleting a row
     // would re-open its name for a publish carrying DIFFERENT bytes — one coordinate, two tarballs
     // over its lifetime, which is the mutability this registry exists to refuse. The version is gone
     // from the packument and still unpublishable, and the message says which of the two it is.
+    //
+    // The republish below carries BLOB_A where the collected version held BLOB_B, which is what
+    // makes this case the REFUSAL half. The restore half is the case beneath it, and the two
+    // together are what "the bytes decide" means.
     repositoryService.ensure("npm", NpmPackagesProfile.KEY);
     npm.publish("npm", "@qits/ui", "1.0.0", BLOB_A, "sha512-a", "a", "{}", Map.of("latest", "1.0.0"));
     npm.publish("npm", "@qits/ui", "1.0.1-main.gab854a1", BLOB_B, "sha512-b", "b", "{}", Map.of());
@@ -155,6 +172,88 @@ class NpmRegistryStorageTest extends ArtifactsTestSupport {
         refused.getMessage().contains("removed by garbage collection"),
         "not 'immutable' — there is no version to look at, and saying so sends a pusher looking for"
             + " one: " + refused.getMessage());
+    assertTrue(
+        refused.getMessage().contains("these are different bytes"),
+        "and it says WHY, because the same coordinate carrying the collected bytes would have been"
+            + " accepted: " + refused.getMessage());
+  }
+
+  @Test
+  void aCollectedVersionIsRestoredByRepublishingTheBytesItHeldAndTheStoneGoesWithIt() {
+    // The door the 2026-09-05 retention incident bought. A version can leave this registry by
+    // accident now — the rules took versions fifteen lockfiles pinned — and a refusal that covers an
+    // identical republish turns a recoverable loss into a permanent one, on the strength of a
+    // guarantee an identical republish does not weaken. The tombstone protects ONE property: a
+    // coordinate must never come to mean different bytes. The same bytes cannot violate it.
+    //
+    // Blob ids are content addresses, so "the same bytes" is a string comparison against what the
+    // stone already recorded — no new state decides this.
+    //
+    // THE SESSION IS CLEARED BETWEEN PHASES, and that is this suite's shape rather than a hint about
+    // the code: every call here shares one Hibernate session (see the case above), while in
+    // production a publish and a collect are two requests with two sessions and two first-level
+    // caches. Without the clear, a row this method removed and then re-persisted under the same
+    // identity is read back out of the session instead of the database, and the case would be
+    // asserting on the cache. Each phase therefore starts by reading the store as a request would.
+    repositoryService.ensure("npm", NpmPackagesProfile.KEY);
+    npm.publish("npm", "@qits/ui", "2.0.0", BLOB_A, "sha512-a", "a", "{}", Map.of("latest", "2.0.0"));
+    npm.publish("npm", "@qits/ui", "2.0.1-main.gdeadbee", BLOB_B, "sha512-b", "b", "{}", Map.of());
+    npm.collect("npm", "@qits/ui", "2.0.1-main.gdeadbee");
+    freshSession();
+    assertTrue(npm.findVersion("npm", "@qits/ui", "2.0.1-main.gdeadbee").isEmpty());
+
+    // The same coordinate, the same blob — a restore, not a reuse.
+    npm.publish("npm", "@qits/ui", "2.0.1-main.gdeadbee", BLOB_B, "sha512-b", "b", "{}", Map.of());
+    freshSession();
+
+    assertEquals(
+        "2.0.1-main.gdeadbee",
+        npm.findVersion("npm", "@qits/ui", "2.0.1-main.gdeadbee").orElseThrow().version(),
+        "the packument lists it again");
+    assertEquals(
+        BLOB_B,
+        npm.findVersion("npm", "@qits/ui", "2.0.1-main.gdeadbee").orElseThrow().tarballBlobId(),
+        "with the bytes it always had — which is the whole of what made it restorable");
+    // The stone is cleared rather than merely ignored: a live row beside a stone saying it was
+    // collected is two answers to one question, and the next collect would write a second stone.
+    assertEquals(0, tombstones.count());
+
+    // A restored version is an ordinary version: collectable again, and restorable again after.
+    npm.collect("npm", "@qits/ui", "2.0.1-main.gdeadbee");
+    freshSession();
+    assertTrue(npm.findVersion("npm", "@qits/ui", "2.0.1-main.gdeadbee").isEmpty());
+    assertEquals(1, tombstones.count(), "and a fresh stone, recording the same bytes again");
+  }
+
+  @Test
+  void aTombstoneThatRecordedNoBytesRefusesEveryRepublish() {
+    // The nullable half of the evidence, as its own case. `tarball_blob_id` is nullable, and a stone
+    // that cannot say which bytes it buried cannot be shown that these are them — so the door stays
+    // shut and the message says which refusal this is. Fail-closed on purpose: the other reading,
+    // "unknown matches anything", is exactly the mutability this table exists to refuse.
+    repositoryService.ensure("npm", NpmPackagesProfile.KEY);
+    QuarkusTransaction.requiringNew()
+        .run(
+            () -> {
+              NpmVersionTombstone blind = new NpmVersionTombstone();
+              blind.repository = "npm";
+              blind.packageName = "@qits/ui";
+              blind.version = "3.0.0";
+              blind.tarballBlobId = null;
+              blind.collectedAt = Instant.now();
+              tombstones.persist(blind);
+            });
+    freshSession();
+
+    NpmException refused =
+        assertThrows(
+            NpmException.class,
+            () -> npm.publish("npm", "@qits/ui", "3.0.0", BLOB_A, "sha512-a", "a", "{}", Map.of()));
+
+    assertEquals(403, refused.statusCode());
+    assertTrue(
+        refused.getMessage().contains("were not recorded"),
+        "and it says which of the two refusals this is: " + refused.getMessage());
   }
 
   @Test

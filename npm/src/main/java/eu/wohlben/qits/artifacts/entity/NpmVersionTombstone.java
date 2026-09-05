@@ -21,8 +21,14 @@ import java.time.Instant;
  *
  * <p><b>This is an identity, not an archive.</b> No manifest, no integrity, no shasum: nothing may
  * ever be served from a tombstone, and holding the fields that would make that possible is how it
- * would eventually happen. {@link #tarballBlobId} is provenance only — which bytes a later sweep
- * reclaimed — and is nullable for that reason.
+ * would eventually happen. {@link #tarballBlobId} stays a bare content address for the same reason —
+ * it names bytes, it does not hold them, and no packument can be assembled from it.
+ *
+ * <p><b>{@link #tarballBlobId} stopped being provenance on 2026-09-05 and became evidence.</b> It is
+ * what lets {@code NpmRegistryService.publish} tell a RESTORE from a reuse: a republish carrying the
+ * same blob id is the same bytes under the same name, which is the one thing this table exists to
+ * guarantee rather than a breach of it. It stays <b>nullable</b>, and a null still refuses every
+ * republish — "I cannot tell which bytes these were" is not evidence that these are them.
  *
  * <p><b>npm's alone.</b> Docker needs no equivalent: an {@link OciTag} is a movable pointer by
  * design and re-pushing one has always been legal, so a deletion there weakens no promise. The
