@@ -68,6 +68,18 @@ public final class NpmClient implements AutoCloseable {
     return parse(packument(repository, pkgPath).body());
   }
 
+  /**
+   * {@link #packument} under another mount — {@code mirror/npm} rather than {@code artifacts/npm},
+   * relative to the base as every other request here is.
+   */
+  public HttpResponse<String> packumentAt(String mount, String repository, String pkgPath) {
+    return send(
+        request(mount, repository, pkgPath)
+            .header("Accept", "application/vnd.npm.install-v1+json, application/json")
+            .GET(),
+        HttpResponse.BodyHandlers.ofString());
+  }
+
   /** Follows a {@code dist.tarball} URL verbatim, which is the only way a real client reaches one. */
   public HttpResponse<byte[]> tarball(String url) {
     HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(url)).GET();
@@ -133,10 +145,14 @@ public final class NpmClient implements AutoCloseable {
   }
 
   private HttpRequest.Builder request(String repository, String pkgPath) {
+    return request("artifacts/npm", repository, pkgPath);
+  }
+
+  private HttpRequest.Builder request(String mount, String repository, String pkgPath) {
     // Built by hand rather than through URI.resolve: `@qits%2fangular` must reach the server with
     // its escape intact, and every convenience API in sight would either decode or re-encode it.
     HttpRequest.Builder builder =
-        HttpRequest.newBuilder(URI.create(base + "artifacts/npm/" + repository + "/" + pkgPath));
+        HttpRequest.newBuilder(URI.create(base + mount + "/" + repository + "/" + pkgPath));
     headers.forEach(builder::header);
     return builder;
   }

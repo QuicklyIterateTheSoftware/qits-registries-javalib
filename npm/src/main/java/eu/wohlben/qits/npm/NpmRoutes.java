@@ -33,6 +33,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.regex.Pattern;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
@@ -94,7 +95,37 @@ public class NpmRoutes {
   @ConfigProperty(name = "qits.artifacts.npm.max-publish-size", defaultValue = "32M")
   MemorySize maxPublishSize;
 
+  /**
+   * A SECOND mount the npm wire also answers on, beside {@link NpmPaths#BASE} — the maven {@code
+   * qits.registries.maven.mirror-mount} restated. Empty for the hosted registry, which owns {@code
+   * /artifacts}; the pull-through mirror sets it to {@code /mirror/npm} so its cache is reachable
+   * through the edge on the mirror's OWN route — the edge routes {@code /artifacts} to the hosted
+   * registry on every vhost, so {@code mirror.<env>.<domain>/artifacts/npm/npmjs} is handed to the
+   * registry and 404s there. Additive: {@code /artifacts/npm} keeps answering in-network.
+   *
+   * <p>Unlike maven's, npm's second mount is not only a route. A packument names its tarballs by
+   * absolute URL, so a document served on one mount must name tarballs on THAT mount — see {@code
+   * externalBase} — or every install through the edge would resolve its metadata and then dial
+   * {@code /artifacts} for the bytes.
+   */
+  @ConfigProperty(name = "qits.registries.npm.mirror-mount")
+  Optional<String> mirrorMount;
+
   void init(@Observes Router router) {
+    registerMount(router, NpmPaths.BASE);
+    mirrorMount
+        .map(String::trim)
+        .filter(mount -> !mount.isEmpty())
+        .ifPresent(mount -> registerMount(router, mount));
+  }
+
+  /**
+   * Registers the whole npm wire under one mount. Called once for {@link NpmPaths#BASE} and, on the
+   * mirror, once more for {@link #mirrorMount}. The handlers read the named path groups and never
+   * the path itself; the one that needs the mount — the packument, for its tarball URLs — is handed
+   * it here, by closure, rather than re-deriving it from the request.
+   */
+  private void registerMount(Router router, String base) {
     // 1. Dist-tags first — the most specific shape here, since it carries two literal segments
     //    (`/-/package/` and `/dist-tags`) that nothing else can produce. Like the tarball/packument
     //    pair below they cannot actually collide with anything, and they are ordered by specificity
@@ -104,9 +135,11 @@ public class NpmRoutes {
     //    The PUT buffers, so it needs a BodyHandler — with a limit of its own, because the default
     //    is 10 MiB and the body here is a JSON string holding a version number. `npm dist-tag rm`
     //    is not served: a DELETE lands on the 405 below, which is the same refusal unpublish gets.
-    router.getWithRegex(NpmPaths.DIST_TAGS).blockingHandler(guarded("get dist-tags", this::serveDistTags));
     router
-        .putWithRegex(NpmPaths.DIST_TAG)
+        .getWithRegex(NpmPaths.distTags(base))
+        .blockingHandler(guarded("get dist-tags", this::serveDistTags));
+    router
+        .putWithRegex(NpmPaths.distTag(base))
         .handler(BodyHandler.create(false).setBodyLimit(MAX_DIST_TAG_BODY))
         .blockingHandler(guarded("put dist-tag", this::putDistTag));
 
@@ -117,19 +150,19 @@ public class NpmRoutes {
     //    HEAD is NOT derived from GET by Vert.x. It needs its own route or every client that probes
     //    before downloading sees a 404.
     router
-        .headWithRegex(NpmPaths.TARBALL)
+        .headWithRegex(NpmPaths.tarball(base))
         .blockingHandler(guarded("head tarball", rc -> serveTarball(rc, false)));
     router
-        .getWithRegex(NpmPaths.TARBALL)
+        .getWithRegex(NpmPaths.tarball(base))
         .blockingHandler(guarded("get tarball", rc -> serveTarball(rc, true)));
 
     // 3. Packuments.
     router
-        .headWithRegex(NpmPaths.PACKUMENT)
-        .blockingHandler(guarded("head packument", rc -> servePackument(rc, false)));
+        .headWithRegex(NpmPaths.packument(base))
+        .blockingHandler(guarded("head packument", rc -> servePackument(rc, base, false)));
     router
-        .getWithRegex(NpmPaths.PACKUMENT)
-        .blockingHandler(guarded("get packument", rc -> servePackument(rc, true)));
+        .getWithRegex(NpmPaths.packument(base))
+        .blockingHandler(guarded("get packument", rc -> servePackument(rc, base, true)));
 
     // 4. Publish. The big buffering route, and the reason it needs a STATED limit: BodyHandler
     //    defaults to 10 MiB (vertx-web's own default, the bug the git host's max-pack-size exists
@@ -137,7 +170,7 @@ public class NpmRoutes {
     //    Sized well under quarkus.http.limits.max-body-size so the application's 413 wins the race
     //    and the client gets a message rather than a reset connection.
     router
-        .putWithRegex(NpmPaths.PACKUMENT)
+        .putWithRegex(NpmPaths.packument(base))
         .handler(BodyHandler.create(false).setBodyLimit(maxPublishSize.asLongValue()))
         .blockingHandler(guarded("publish", this::publish));
 
@@ -147,7 +180,7 @@ public class NpmRoutes {
     //    `npm dist-tag rm` lands here too, and gets the same answer for a related reason: a tag this
     //    registry served yesterday and does not serve today is a consumer's install breaking.
     router
-        .route(HttpMethod.DELETE, NpmPaths.BASE + "/*")
+        .route(HttpMethod.DELETE, base + "/*")
         .handler(
             rc ->
                 NpmErrors.send(
@@ -157,8 +190,8 @@ public class NpmRoutes {
     //    login handshake — is a JSON 404, never Vert.x' default HTML page. npm degrades gracefully
     //    on all of them: a search 404s to "no results", an audit 404s to "not audited", and an
     //    install proceeds. That is why they are absent rather than stubbed.
-    router.route(NpmPaths.BASE).handler(this::notFound);
-    router.route(NpmPaths.BASE + "/*").handler(this::notFound);
+    router.route(base).handler(this::notFound);
+    router.route(base + "/*").handler(this::notFound);
   }
 
   private void notFound(RoutingContext rc) {
@@ -176,11 +209,11 @@ public class NpmRoutes {
    * bandwidth change, not a correctness one, and doing it wrong silently breaks installs that need a
    * field we dropped.
    */
-  private void servePackument(RoutingContext rc, boolean withBody) {
+  private void servePackument(RoutingContext rc, String mount, boolean withBody) {
     String repository = rc.pathParam("repository");
     String type = registry.requireNpmRepository(repository);
     NpmPackageName pkg = packageOf(rc);
-    String tarballBase = externalBase(rc, repository);
+    String tarballBase = externalBase(rc, mount, repository);
 
     ObjectNode document;
     if (NpmProxyProfile.KEY.equals(type)) {
@@ -603,12 +636,17 @@ public class NpmRoutes {
    * always carries the right answer, while a configured value would be right for one caller and
    * quietly wrong for the other.
    *
+   * <p>The PATH is the mount the packument request arrived on, for the same reason: it is the one
+   * the client can demonstrably reach. A document fetched through the edge at {@code /mirror/npm}
+   * names tarballs at {@code /mirror/npm}; the same document fetched in-network at {@code
+   * /artifacts/npm} names them there, byte for byte as before the second mount existed.
+   *
    * <p>The forwarded authority is shape-checked before it is used. Not because the threat model
    * needs it — inside the deployment everything here is trusted — but because a malformed value
    * produces a document whose tarball URLs fail far away from here, and a 400 at the boundary is a
    * much shorter path to the cause.
    */
-  private static String externalBase(RoutingContext rc, String repository) {
+  private static String externalBase(RoutingContext rc, String mount, String repository) {
     HttpServerRequest request = rc.request();
     String forwardedHost = firstToken(request.getHeader("X-Forwarded-Host"));
     String authority;
@@ -640,7 +678,7 @@ public class NpmRoutes {
       throw new NpmException(
           400, "cannot build an absolute tarball url from this request's Host/X-Forwarded-* headers");
     }
-    return scheme + "://" + authority + NpmPaths.BASE + "/" + repository;
+    return scheme + "://" + authority + mount + "/" + repository;
   }
 
   private static String defaultScheme(HttpServerRequest request) {

@@ -65,8 +65,8 @@ final class NpmPaths {
    */
   private static final String TAG = "(?<tag>[A-Za-z0-9][A-Za-z0-9._~-]{0,63})";
 
-  static final String PACKUMENT = route(REPOSITORY + "/" + PACKAGE);
-  static final String TARBALL = route(REPOSITORY + "/" + PACKAGE + "/-/" + TARBALL_FILE);
+  static final String PACKUMENT = packument(BASE);
+  static final String TARBALL = tarball(BASE);
 
   /**
    * {@code /-/package/<pkg>/dist-tags} — npm's tag surface, which is <b>not</b> under the package's
@@ -78,20 +78,43 @@ final class NpmPaths {
    * name may not begin with {@code -}, so no path starting {@code <repo>/-/} is readable as one.
    * {@code NpmPathsTest} pins it, in both directions.
    */
-  static final String DIST_TAGS = route(REPOSITORY + "/-/package/" + PACKAGE + "/dist-tags");
+  static final String DIST_TAGS = distTags(BASE);
 
   /** {@link #DIST_TAGS} plus the tag being moved — the {@code npm dist-tag add} target. */
-  static final String DIST_TAG = DIST_TAGS + "/" + TAG;
+  static final String DIST_TAG = distTag(BASE);
+
+  // The same four shapes under an arbitrary mount, for a deployment that answers on a SECOND base
+  // beside BASE — MavenPaths.artifactRoute's reason verbatim: the pull-through mirror serves its npm
+  // cache under its own /mirror prefix as well, because the edge routes /artifacts to the hosted
+  // registry that owns that route and the mirror is unreachable there from outside. The named groups
+  // are identical under every mount, so every pathParam in the handlers is mount-agnostic and one
+  // set of handlers serves both. Methods rather than constants, for the inlining reason on route.
+
+  static String packument(String mount) {
+    return route(mount, REPOSITORY + "/" + PACKAGE);
+  }
+
+  static String tarball(String mount) {
+    return route(mount, REPOSITORY + "/" + PACKAGE + "/-/" + TARBALL_FILE);
+  }
+
+  static String distTags(String mount) {
+    return route(mount, REPOSITORY + "/-/package/" + PACKAGE + "/dist-tags");
+  }
+
+  static String distTag(String mount) {
+    return distTags(mount) + "/" + TAG;
+  }
 
   /**
-   * Builds a route regex under {@link #BASE}.
+   * Builds a route regex under a mount — {@link #BASE}, or the second one a deployment names.
    *
    * <p>A method call rather than string concatenation, and that is not styling — the reason is
    * {@code RegistryPaths.route}'s verbatim: a {@code static final String} initialised from a
    * constant expression is inlined by javac into every class that reads it, including the test,
    * which would then keep asserting against whatever the value was when it was last compiled.
    */
-  private static String route(String suffix) {
-    return BASE + "/" + suffix;
+  private static String route(String mount, String suffix) {
+    return mount + "/" + suffix;
   }
 }
