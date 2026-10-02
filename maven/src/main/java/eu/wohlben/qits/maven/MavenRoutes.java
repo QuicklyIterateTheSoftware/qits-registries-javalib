@@ -8,6 +8,7 @@ import eu.wohlben.qits.artifacts.control.MavenProxyProfile;
 import eu.wohlben.qits.artifacts.control.MavenRegistryService;
 import eu.wohlben.qits.artifacts.error.MavenException;
 import eu.wohlben.qits.registry.BlobSender;
+import eu.wohlben.qits.registry.ContentHashLedger;
 import eu.wohlben.qits.registry.OciRequestBody;
 import io.quarkus.runtime.configuration.MemorySize;
 import io.vertx.core.Handler;
@@ -91,6 +92,7 @@ public class MavenRoutes {
   @Inject MavenUpstream upstream;
   @Inject BlobStore blobStore;
   @Inject BlobSender blobSender;
+  @Inject ContentHashLedger contentHashLedger;
 
   /** How many times one cached path may be thrown away and pulled through again. */
   @Inject MavenProxyHealing heals;
@@ -535,6 +537,11 @@ public class MavenRoutes {
     String path = rc.pathParam("path");
     String file = MavenLayout.fileOf(path);
 
+    // Read and shape-check the content hash BEFORE anything is staged: a malformed claim is a 400
+    // with nothing stored, the same stance the checksum PUT takes on a mismatched claim. Absent is
+    // null and this deploy proceeds exactly as it did before the header existed.
+    String contentHash = requireValidContentHash(rc);
+
     // The client's own metadata is accepted and DISCARDED, at either level and with its checksums.
     // Refusing would break mvn deploy on its final request, after every artifact already landed;
     // storing it would serve a merge the client computed, which goes stale the moment a second
@@ -573,7 +580,40 @@ public class MavenRoutes {
     }
     blobStore.promote(staged);
     registry.deploy(repository, parsed, staged.sha256(), staged.size());
+
+    // Recorded only for the release pom: the deploy plugin uploads the pom last, so it is the
+    // version's "published" marker — the same probe qits-ci's presence check already makes. A
+    // header on the jar, a checksum or any other file of this deploy is silently ignored, and a
+    // different value already recorded for this GAV answers through here as the ledger's own 409.
+    if (contentHash != null && isReleasePom(parsed)) {
+      contentHashLedger.record(
+          "maven", repository, parsed.groupId() + ":" + parsed.artifactId(), parsed.version(), contentHash);
+    }
     respond(rc, 201, "text/plain; charset=utf-8", "stored\n".getBytes(StandardCharsets.UTF_8), true);
+  }
+
+  /** The release pom is the file {@code <artifactId>-<version>.pom} of a non-snapshot version. */
+  private static boolean isReleasePom(MavenLayout.ArtifactPath parsed) {
+    return !MavenLayout.isSnapshotVersion(parsed.version())
+        && parsed.file().equals(parsed.artifactId() + "-" + parsed.version() + ".pom");
+  }
+
+  /**
+   * The optional {@value ContentHashLedger#HEADER} header, shape-checked against {@link
+   * ContentHashLedger#FORMAT}. Absent is null, meaning "record nothing" rather than "record an
+   * absence" — a value that fails the shape check is a 400 naming it, exactly as a malformed
+   * checksum claim is.
+   */
+  private String requireValidContentHash(RoutingContext rc) {
+    String value = rc.request().getHeader(ContentHashLedger.HEADER);
+    if (value == null) {
+      return null;
+    }
+    if (!ContentHashLedger.FORMAT.matcher(value).matches()) {
+      throw new MavenException(
+          400, ContentHashLedger.HEADER + " '" + value + "' is not v<n>:<alg>:<hex>");
+    }
+    return value;
   }
 
   /**
