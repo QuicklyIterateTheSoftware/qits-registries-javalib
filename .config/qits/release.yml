@@ -1,7 +1,7 @@
 archetype: maven-library
 artifacts:
-  - { type: maven, name: "eu.wohlben.qits:qits-blobstore", sbom: blobstore/target/sbom.json }
-  - { type: maven, name: "eu.wohlben.qits:qits-registries-common", sbom: common/target/sbom.json }
-  - { type: maven, name: "eu.wohlben.qits:qits-registries-npm", sbom: npm/target/sbom.json }
-  - { type: maven, name: "eu.wohlben.qits:qits-registries-maven", sbom: maven/target/sbom.json }
-  - { type: maven, name: "eu.wohlben.qits:qits-registries-oci", sbom: oci/target/sbom.json }
+  - { type: maven, name: "eu.wohlben.qits:qits-blobstore", path: blobstore, sbom: blobstore/target/sbom.json }
+  - { type: maven, name: "eu.wohlben.qits:qits-registries-common", path: common, sbom: common/target/sbom.json, link: [qits-blobstore] }
+  - { type: maven, name: "eu.wohlben.qits:qits-registries-npm", path: npm, sbom: npm/target/sbom.json, link: [qits-blobstore, qits-registries-common] }
+  - { type: maven, name: "eu.wohlben.qits:qits-registries-maven", path: maven, sbom: maven/target/sbom.json, link: [qits-blobstore, qits-registries-common] }
+  - { type: maven, name: "eu.wohlben.qits:qits-registries-oci", path: oci, sbom: oci/target/sbom.json, link: [qits-blobstore, qits-registries-common] }
