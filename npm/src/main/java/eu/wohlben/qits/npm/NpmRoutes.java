@@ -11,6 +11,7 @@ import eu.wohlben.qits.artifacts.control.NpmProxyProfile;
 import eu.wohlben.qits.artifacts.control.NpmRegistryService;
 import eu.wohlben.qits.artifacts.error.NpmException;
 import eu.wohlben.qits.registry.BlobSender;
+import eu.wohlben.qits.registry.ContentHashLedger;
 import io.quarkus.runtime.configuration.MemorySize;
 import io.vertx.core.Handler;
 import io.vertx.core.buffer.Buffer;
@@ -91,6 +92,7 @@ public class NpmRoutes {
   @Inject BlobStore blobStore;
   @Inject BlobSender blobSender;
   @Inject ObjectMapper json;
+  @Inject ContentHashLedger contentHashLedger;
 
   @ConfigProperty(name = "qits.artifacts.npm.max-publish-size", defaultValue = "32M")
   MemorySize maxPublishSize;
@@ -466,6 +468,11 @@ public class NpmRoutes {
     }
     NpmPackageName pkg = packageOf(rc);
 
+    // Read and shape-check the content hash BEFORE anything is staged: a malformed claim is a 400
+    // with nothing stored. Absent is null and this publish proceeds exactly as it did before the
+    // header existed.
+    String contentHash = requireValidContentHash(rc);
+
     JsonNode document = body(rc);
     String declared = document.path("name").asText(null);
     if (declared != null && !declared.isBlank() && !declared.equals(pkg.full())) {
@@ -479,7 +486,7 @@ public class NpmRoutes {
     JsonNode attachments = document.path("_attachments");
 
     for (Map.Entry<String, JsonNode> entry : versions.properties()) {
-      publishOne(repository, pkg, entry.getKey(), entry.getValue(), attachments, document);
+      publishOne(repository, pkg, entry.getKey(), entry.getValue(), attachments, document, contentHash);
     }
 
     rc.response()
@@ -494,7 +501,8 @@ public class NpmRoutes {
       String version,
       JsonNode manifest,
       JsonNode attachments,
-      JsonNode document) {
+      JsonNode document,
+      String contentHash) {
 
     if (!manifest.isObject()) {
       throw new NpmException(400, "the manifest for " + version + " is not a JSON object");
@@ -522,6 +530,30 @@ public class NpmRoutes {
         shasum,
         manifest.toString(),
         tagsNaming(document, version));
+
+    // Recorded after the publish succeeds. A different value already recorded for this name and
+    // version answers through here as the ledger's own 409 — npm cannot reach it on a re-publish of
+    // the same version, because that is already a 403 above.
+    if (contentHash != null) {
+      contentHashLedger.record("npm", repository, pkg.full(), version, contentHash);
+    }
+  }
+
+  /**
+   * The optional {@value ContentHashLedger#HEADER} header, shape-checked against {@link
+   * ContentHashLedger#FORMAT}. Absent is null, meaning "record nothing" rather than "record an
+   * absence" — a value that fails the shape check is a 400 naming it.
+   */
+  private String requireValidContentHash(RoutingContext rc) {
+    String value = rc.request().getHeader(ContentHashLedger.HEADER);
+    if (value == null) {
+      return null;
+    }
+    if (!ContentHashLedger.FORMAT.matcher(value).matches()) {
+      throw new NpmException(
+          400, ContentHashLedger.HEADER + " '" + value + "' is not v<n>:<alg>:<hex>");
+    }
+    return value;
   }
 
   /**

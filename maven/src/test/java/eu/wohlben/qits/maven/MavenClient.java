@@ -37,6 +37,17 @@ public final class MavenClient implements AutoCloseable {
         HttpResponse.BodyHandlers.ofString());
   }
 
+  /** The same PUT, with extra headers — name, value, name, value, … — such as the content hash. */
+  public HttpResponse<String> put(
+      String repository, String path, byte[] bytes, String... headers) {
+    HttpRequest.Builder request =
+        request(repository, path).PUT(HttpRequest.BodyPublishers.ofByteArray(bytes));
+    for (int i = 0; i < headers.length; i += 2) {
+      request.header(headers[i], headers[i + 1]);
+    }
+    return send(request, HttpResponse.BodyHandlers.ofString());
+  }
+
   public HttpResponse<byte[]> get(String repository, String path) {
     return send(request(repository, path).GET(), HttpResponse.BodyHandlers.ofByteArray());
   }
