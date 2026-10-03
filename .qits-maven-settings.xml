@@ -3,14 +3,15 @@
           xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
           xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.2.0 https://maven.apache.org/xsd/settings-1.2.0.xsd">
   <mirrors>
-    <!-- Exact repository-id matches win over Maven's external:http:* blocker. This permits only
-         the platform's own repository URL supplied to the step, not arbitrary HTTP repos.
+    <!-- The platform's hosted Maven, https://registry.qits.$QITS_DOMAIN/artifacts/maven/maven.
+         Maven cannot compute a string, so the URL arrives derived: the CI recipe
+         (release-archetypes/maven-library.yml) builds it from QITS_DOMAIN. Mirrors exactly the
+         pom's `qits-maven` id.
 
          Read only by the two pipelines in .config/qits (`-s .qits-maven-settings.xml`), which run
-         inside a step container and reach the registry at a non-localhost address to resolve
-         qits-blobstore and qits-db-core. A developer's build needs none of it, because the pom's
-         default address is on localhost and the blocker exempts localhost. Same file, same reason,
-         as qits-eventstream's and qits-blobstore's. -->
+         inside a step container to resolve qits-blobstore and qits-db-core. A plain developer build
+         resolves straight off the pom's own public default and needs none of this. Same file, same
+         reason, as qits-eventstream's and qits-blobstore's. -->
     <mirror>
       <id>qits-maven-network</id>
       <mirrorOf>qits-maven</mirrorOf>
