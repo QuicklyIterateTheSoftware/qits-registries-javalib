@@ -55,6 +55,11 @@
         <!-- DbRetry, the read patience seam. Published by libs/qits-integrations-quarkus, so it is
              pinned to a released calver rather than following a snapshot. -->
         <qits.db-core.version>2026.1002.70617</qits.db-core.version>
+        <!-- qits-http-core (qits-1198): @RawHttpClient only, on MavenUpstream/NpmUpstream/MirrorUpstream
+             — those three talk to Maven Central, registry.npmjs.org and arbitrary upstream OCI
+             registries, none of them a qits service, so none of them is wrapped. Annotation-only use,
+             CLASS retention, so `provided` below costs the format modules nothing at runtime. -->
+        <qits.http-core.version>0-qits-1198-local</qits.http-core.version>
         <qits.maven.repository.url>https://registry.qits.wohlben.eu/artifacts/maven/maven</qits.maven.repository.url>
         <maven.compiler.release>25</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -141,6 +146,16 @@
                 <groupId>${project.groupId}</groupId>
                 <artifactId>qits-db-core</artifactId>
                 <version>${qits.db-core.version}</version>
+            </dependency>
+            <!-- @RawHttpClient only (qits-1198): MavenUpstream, NpmUpstream and MirrorUpstream each
+                 declare this to annotate their HttpClient as deliberately unwrapped — they all talk
+                 to an external registry, never a qits service. CLASS retention, so `provided` is
+                 enough: nothing needs the jar at runtime. -->
+            <dependency>
+                <groupId>${project.groupId}</groupId>
+                <artifactId>qits-http-core</artifactId>
+                <version>${qits.http-core.version}</version>
+                <scope>provided</scope>
             </dependency>
             <!-- The reactor's own module, so the format modules depend on it version-less. -->
             <dependency>

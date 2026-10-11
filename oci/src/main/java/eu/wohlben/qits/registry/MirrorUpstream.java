@@ -8,6 +8,7 @@ import eu.wohlben.qits.artifacts.control.OciMediaTypes;
 import eu.wohlben.qits.artifacts.control.OciRegistryService;
 import eu.wohlben.qits.artifacts.error.OciCode;
 import eu.wohlben.qits.artifacts.error.OciException;
+import eu.wohlben.qits.http.RawHttpClient;
 import io.quarkus.runtime.configuration.MemorySize;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -69,8 +70,14 @@ import org.jboss.logging.Logger;
  * NpmUpstream}'s, inherited wholesale: a JDK {@link HttpClient} <b>instance</b> field (never
  * static — the native-image rule), a connect timeout, a per-request timeout sized by what is being
  * fetched, and no retries.
+ *
+ * <p>{@code @RawHttpClient} (qits-1198): every upstream a mirror namespace names is an external
+ * registry — Docker Hub, quay, the Red Hat registry, or whatever {@code oci_mirror_upstream} points
+ * at next — never a qits service, so this client carries no trace id and no caller header.
  */
 @ApplicationScoped
+@RawHttpClient(reason = "oci_mirror_upstream names an external OCI registry (Docker Hub, quay, the "
+    + "Red Hat registry, ...), never a qits service: no platform headers or trace ids belong there")
 public class MirrorUpstream {
 
   private static final Logger LOG = Logger.getLogger(MirrorUpstream.class);

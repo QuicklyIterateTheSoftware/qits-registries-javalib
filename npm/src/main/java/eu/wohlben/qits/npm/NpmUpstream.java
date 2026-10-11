@@ -6,6 +6,7 @@ import eu.wohlben.qits.blobstore.control.BlobStore;
 import eu.wohlben.qits.artifacts.control.NpmPackageName;
 import eu.wohlben.qits.artifacts.control.NpmRegistryService;
 import eu.wohlben.qits.artifacts.error.NpmException;
+import eu.wohlben.qits.http.RawHttpClient;
 import io.quarkus.runtime.configuration.MemorySize;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -48,6 +49,8 @@ import org.jboss.logging.Logger;
  * suite drives an in-process stub), so it takes one manual smoke on a deployment; see the README.
  */
 @ApplicationScoped
+@RawHttpClient(reason = "registry.npmjs.org (or the configured upstream) is not a qits service: "
+    + "no platform headers or trace ids belong on a request to the public npm registry")
 public class NpmUpstream {
 
   private static final Logger LOG = Logger.getLogger(NpmUpstream.class);

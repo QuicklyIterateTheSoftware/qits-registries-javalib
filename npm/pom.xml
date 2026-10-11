@@ -38,6 +38,13 @@
             <artifactId>qits-db-core</artifactId>
         </dependency>
         <dependency>
+            <!-- @RawHttpClient only (qits-1198): NpmUpstream's HttpClient talks to
+                 registry.npmjs.org, not a qits service. Annotation-only, CLASS retention —
+                 provided from the parent. -->
+            <groupId>${project.groupId}</groupId>
+            <artifactId>qits-http-core</artifactId>
+        </dependency>
+        <dependency>
             <groupId>io.quarkus</groupId>
             <artifactId>quarkus-arc</artifactId>
         </dependency>

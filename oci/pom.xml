@@ -34,6 +34,13 @@
             <artifactId>qits-db-core</artifactId>
         </dependency>
         <dependency>
+            <!-- @RawHttpClient only (qits-1198): MirrorUpstream's HttpClient talks to arbitrary
+                 upstream OCI registries, never a qits service. Annotation-only, CLASS retention —
+                 provided from the parent. -->
+            <groupId>${project.groupId}</groupId>
+            <artifactId>qits-http-core</artifactId>
+        </dependency>
+        <dependency>
             <groupId>io.quarkus</groupId>
             <artifactId>quarkus-arc</artifactId>
         </dependency>

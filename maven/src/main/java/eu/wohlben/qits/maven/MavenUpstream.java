@@ -3,6 +3,7 @@ package eu.wohlben.qits.maven;
 import eu.wohlben.qits.blobstore.control.BlobStore;
 import eu.wohlben.qits.artifacts.control.MavenRegistryService;
 import eu.wohlben.qits.artifacts.error.MavenException;
+import eu.wohlben.qits.http.RawHttpClient;
 import io.quarkus.runtime.configuration.MemorySize;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -49,6 +50,8 @@ import org.jboss.logging.Logger;
  * cost one bounded wait and never pin the thread.
  */
 @ApplicationScoped
+@RawHttpClient(reason = "repo1.maven.org (or the configured upstream) is not a qits service: "
+    + "no platform headers or trace ids belong on a request to Maven Central")
 public class MavenUpstream {
 
   private static final Logger LOG = Logger.getLogger(MavenUpstream.class);
