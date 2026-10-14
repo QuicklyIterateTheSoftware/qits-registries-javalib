@@ -59,7 +59,7 @@
              — those three talk to Maven Central, registry.npmjs.org and arbitrary upstream OCI
              registries, none of them a qits service, so none of them is wrapped. Annotation-only use,
              CLASS retention, so `provided` below costs the format modules nothing at runtime. -->
-        <qits.http-core.version>2026.1011.185745</qits.http-core.version>
+        <qits.http-core.version>2026.1013.64811</qits.http-core.version>
         <qits.maven.repository.url>https://registry.qits.wohlben.eu/artifacts/maven/maven</qits.maven.repository.url>
         <maven.compiler.release>25</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
