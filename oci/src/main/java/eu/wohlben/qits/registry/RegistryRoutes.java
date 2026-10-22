@@ -127,23 +127,38 @@ public class RegistryRoutes {
 
     // 4. Blobs. HEAD is not derived from GET by Vert.x — it needs its own route, and docker asks
     //    HEAD before every upload, so getting it wrong means re-uploading every layer every time.
-    router.headWithRegex(RegistryPaths.BLOB).blockingHandler(guarded("head blob", rc -> serveBlob(rc, false)));
-    router.getWithRegex(RegistryPaths.BLOB).blockingHandler(guarded("get blob", rc -> serveBlob(rc, true)));
+    //
+    //    Every READ route from here on is registered UNORDERED — the trailing `false` — and every write
+    //    keeps the ordered default. An ordered blockingHandler does not get a worker of its own: its
+    //    tasks join one queue per event loop, shared by every request on that loop (Quarkus'
+    //    duplicated contexts share it too), and run one at a time. BlobSender holds its worker for
+    //    the whole transfer, parked on the client's drain for up to the drain timeout, so behind an
+    //    ordered blob GET to a slow puller every later read on that loop — a manifest HEAD included
+    //    — waited out the transfer (qits-1510). Reads share no state that needs serialising; the
+    //    upload session's routes, status included, stay ordered because they do.
+    router
+        .headWithRegex(RegistryPaths.BLOB)
+        .blockingHandler(guarded("head blob", rc -> serveBlob(rc, false)), false);
+    router
+        .getWithRegex(RegistryPaths.BLOB)
+        .blockingHandler(guarded("get blob", rc -> serveBlob(rc, true)), false);
 
     // 5. Manifests. The PUT is the one route that buffers, capped well under the wire ceiling.
     router
         .headWithRegex(RegistryPaths.MANIFEST)
-        .blockingHandler(guarded("head manifest", rc -> serveManifest(rc, false)));
+        .blockingHandler(guarded("head manifest", rc -> serveManifest(rc, false)), false);
     router
         .getWithRegex(RegistryPaths.MANIFEST)
-        .blockingHandler(guarded("get manifest", rc -> serveManifest(rc, true)));
+        .blockingHandler(guarded("get manifest", rc -> serveManifest(rc, true)), false);
     router
         .putWithRegex(RegistryPaths.MANIFEST)
         .handler(BodyHandler.create(false).setBodyLimit(maxManifestSize.asLongValue()))
         .blockingHandler(guarded("put manifest", this::putManifest));
 
     // 6. Tags.
-    router.getWithRegex(RegistryPaths.TAGS_LIST).blockingHandler(guarded("list tags", this::listTags));
+    router
+        .getWithRegex(RegistryPaths.TAGS_LIST)
+        .blockingHandler(guarded("list tags", this::listTags), false);
 
     // 7. DELETE is deliberately unimplemented — there is no garbage collection, and nothing should
     //    come to depend on deletion semantics before they exist. 405 rather than 404, which would

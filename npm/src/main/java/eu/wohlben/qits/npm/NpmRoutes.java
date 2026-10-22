@@ -137,9 +137,15 @@ public class NpmRoutes {
     //    The PUT buffers, so it needs a BodyHandler — with a limit of its own, because the default
     //    is 10 MiB and the body here is a JSON string holding a version number. `npm dist-tag rm`
     //    is not served: a DELETE lands on the 405 below, which is the same refusal unpublish gets.
+    //
+    //    Every READ route in this method is registered UNORDERED — the trailing `false` — and both
+    //    writes keep the ordered default. An ordered blockingHandler joins one task queue per event
+    //    loop, shared by every request on that loop, and BlobSender holds its worker for a whole
+    //    transfer: one tarball going to a slow client would stall every later read on the loop
+    //    behind it, packuments included (qits-1510, the same as on /v2).
     router
         .getWithRegex(NpmPaths.distTags(base))
-        .blockingHandler(guarded("get dist-tags", this::serveDistTags));
+        .blockingHandler(guarded("get dist-tags", this::serveDistTags), false);
     router
         .putWithRegex(NpmPaths.distTag(base))
         .handler(BodyHandler.create(false).setBodyLimit(MAX_DIST_TAG_BODY))
@@ -153,18 +159,18 @@ public class NpmRoutes {
     //    before downloading sees a 404.
     router
         .headWithRegex(NpmPaths.tarball(base))
-        .blockingHandler(guarded("head tarball", rc -> serveTarball(rc, false)));
+        .blockingHandler(guarded("head tarball", rc -> serveTarball(rc, false)), false);
     router
         .getWithRegex(NpmPaths.tarball(base))
-        .blockingHandler(guarded("get tarball", rc -> serveTarball(rc, true)));
+        .blockingHandler(guarded("get tarball", rc -> serveTarball(rc, true)), false);
 
     // 3. Packuments.
     router
         .headWithRegex(NpmPaths.packument(base))
-        .blockingHandler(guarded("head packument", rc -> servePackument(rc, base, false)));
+        .blockingHandler(guarded("head packument", rc -> servePackument(rc, base, false)), false);
     router
         .getWithRegex(NpmPaths.packument(base))
-        .blockingHandler(guarded("get packument", rc -> servePackument(rc, base, true)));
+        .blockingHandler(guarded("get packument", rc -> servePackument(rc, base, true)), false);
 
     // 4. Publish. The big buffering route, and the reason it needs a STATED limit: BodyHandler
     //    defaults to 10 MiB (vertx-web's own default, the bug the git host's max-pack-size exists

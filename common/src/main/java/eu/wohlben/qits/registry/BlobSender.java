@@ -26,6 +26,12 @@ import org.jboss.logging.Logger;
  * the <b>calling worker thread</b>: every route that serves a blob is already a {@code
  * blockingHandler}, so the thread is there to be used and the store's reads are blocking JDBC.
  *
+ * <p>That makes every such route's registration part of this class's contract: it must be an
+ * <b>unordered</b> {@code blockingHandler(handler, false)}. The one-argument form is ordered, and
+ * ordered tasks of one event loop run one at a time from a single queue shared by every request on
+ * that loop — so a transfer parked below on a slow client would hold up every read queued behind it
+ * for as long as the transfer takes, up to the drain timeout per stall (qits-1510).
+ *
  * <p><b>The one thing that must not be got wrong is backpressure.</b> The database answers far
  * faster than a client on a slow link reads, so a loop that wrote without looking would queue the
  * whole blob in Netty's buffers — a gigabyte layer, in heap, per slow puller. So: one {@link

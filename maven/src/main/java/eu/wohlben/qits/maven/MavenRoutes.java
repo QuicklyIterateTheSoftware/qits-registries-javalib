@@ -134,8 +134,17 @@ public class MavenRoutes {
   private void registerMount(Router router, String base, String artifact) {
     // HEAD is NOT derived from GET by Vert.x — every GET route needs its HEAD twin, or every client
     // that probes before downloading sees a 404.
-    router.headWithRegex(artifact).blockingHandler(guarded("head artifact", rc -> serve(rc, false)));
-    router.getWithRegex(artifact).blockingHandler(guarded("get artifact", rc -> serve(rc, true)));
+    //
+    // Both reads are UNORDERED — the trailing `false` — while the deploy keeps the ordered default. An
+    // ordered blockingHandler joins one task queue per event loop, shared by every request on that
+    // loop, and BlobSender holds its worker for a whole transfer: one jar going to a slow client
+    // would stall every later read on the loop behind it (qits-1510, the same as on /v2).
+    router
+        .headWithRegex(artifact)
+        .blockingHandler(guarded("head artifact", rc -> serve(rc, false)), false);
+    router
+        .getWithRegex(artifact)
+        .blockingHandler(guarded("get artifact", rc -> serve(rc, true)), false);
 
     // The deploy PUT streams rather than buffers: a BodyHandler would hold the whole artifact in
     // memory, and a raw HttpServerRequest read is bounded by nothing — the two rules OciRequestBody
