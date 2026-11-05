@@ -67,7 +67,7 @@
 
         <quarkus.platform.artifact-id>quarkus-bom</quarkus.platform.artifact-id>
         <quarkus.platform.group-id>io.quarkus.platform</quarkus.platform.group-id>
-        <quarkus.platform.version>3.34.6</quarkus.platform.version>
+        <quarkus.platform.version>3.40.1</quarkus.platform.version>
 
         <!-- Real postgres for the store's suite and the format suites alike: the blob store's only
              backend is postgres now, so every suite that stores a byte needs one. Zonky resolves the
