@@ -54,7 +54,7 @@
     <properties>
         <!-- DbRetry, the read patience seam. Published by libs/qits-integrations-quarkus, so it is
              pinned to a released calver rather than following a snapshot. -->
-        <qits.db-core.version>2026.1106.507</qits.db-core.version>
+        <qits.db-core.version>2026.1107.191249</qits.db-core.version>
         <!-- qits-http-core (qits-1198): @RawHttpClient only, on MavenUpstream/NpmUpstream/MirrorUpstream
              — those three talk to Maven Central, registry.npmjs.org and arbitrary upstream OCI
              registries, none of them a qits service, so none of them is wrapped. Annotation-only use,
