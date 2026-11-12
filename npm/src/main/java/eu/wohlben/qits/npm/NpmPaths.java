@@ -107,6 +107,16 @@ final class NpmPaths {
   }
 
   /**
+   * {@code /-/ping} — what {@code npm ping} dials, as {@code <registry>/-/ping?write=true}. Lives
+   * in the same registry-level {@code /-/} namespace as {@link #DIST_TAGS}, and cannot collide with
+   * {@link #PACKUMENT} or {@link #TARBALL} for the same reason neither of those can: a package name
+   * may not start with {@code -}.
+   */
+  static String ping(String mount) {
+    return route(mount, REPOSITORY + "/-/ping");
+  }
+
+  /**
    * Builds a route regex under a mount — {@link #BASE}, or the second one a deployment names.
    *
    * <p>A method call rather than string concatenation, and that is not styling — the reason is

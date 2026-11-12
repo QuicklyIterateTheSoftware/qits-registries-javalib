@@ -583,6 +583,71 @@ class NpmRegistryTest {
     }
   }
 
+  // --- ping ---------------------------------------------------------------------------------------
+
+  @Test
+  void pingAnswersOkOnAHostedRepository() {
+    try (NpmClient npm = client()) {
+      HttpResponse<String> answered = npm.get("artifacts/npm/npm/-/ping");
+      assertEquals(200, answered.statusCode());
+      assertEquals("application/json; charset=utf-8", contentType(answered));
+      assertEquals("{}", answered.body());
+    }
+  }
+
+  @Test
+  void pingAnswersOkOnAProxyRepositoryWithoutTouchingUpstream() {
+    // The default upstream in this suite (see application.properties) is an unreachable address;
+    // if ping dialled it, this would fail or hang rather than answer.
+    try (NpmClient npm = client()) {
+      HttpResponse<String> answered = npm.get("artifacts/npm/npmjs/-/ping");
+      assertEquals(200, answered.statusCode());
+      assertEquals("application/json; charset=utf-8", contentType(answered));
+      assertEquals("{}", answered.body());
+    }
+  }
+
+  @Test
+  void pingIgnoresItsQueryString() {
+    // `npm ping` dials `?write=true`. Nothing here reads it either way.
+    try (NpmClient npm = client()) {
+      assertEquals(200, npm.get("artifacts/npm/npm/-/ping?write=true").statusCode());
+    }
+  }
+
+  @Test
+  void pingRespondsToHead() {
+    try (NpmClient npm = client()) {
+      HttpResponse<Void> head = npm.head(root + "artifacts/npm/npm/-/ping");
+      assertEquals(200, head.statusCode());
+      assertEquals("2", head.headers().firstValue("content-length").orElseThrow());
+    }
+  }
+
+  @Test
+  void pingOnAnUnknownRepositoryIsAJson404() {
+    try (NpmClient npm = client()) {
+      HttpResponse<String> answered = npm.get("artifacts/npm/no-such-npm-repo/-/ping");
+      assertEquals(404, answered.statusCode());
+      assertTrue(NpmClient.parse(answered.body()).has("error"), answered.body());
+    }
+  }
+
+  @Test
+  void pingingAProxyRepositoryLeavesTheUpstreamCountersUnchanged() {
+    // Pinned on the stub rather than on a mock: a proxy repository must answer ping for itself,
+    // exactly as the hosted repository does, never by dialling npmjs on the caller's behalf.
+    int packumentsBefore = StubNpmRegistry.INSTANCE.packumentRequests();
+    int tarballsBefore = StubNpmRegistry.INSTANCE.tarballRequests();
+
+    try (NpmClient npm = client()) {
+      assertEquals(200, npm.get("artifacts/npm/npmjs/-/ping").statusCode());
+    }
+
+    assertEquals(packumentsBefore, StubNpmRegistry.INSTANCE.packumentRequests());
+    assertEquals(tarballsBefore, StubNpmRegistry.INSTANCE.tarballRequests());
+  }
+
   // --- HEAD -------------------------------------------------------------------------------------
 
   @Test

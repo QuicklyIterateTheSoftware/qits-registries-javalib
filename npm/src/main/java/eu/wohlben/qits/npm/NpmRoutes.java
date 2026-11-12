@@ -194,16 +194,51 @@ public class NpmRoutes {
                 NpmErrors.send(
                     rc, 405, "this registry does not implement unpublish"));
 
-    // 6. Everything else under the base — /-/v1/search, /-/npm/v1/security/audits, /-/whoami, the
+    // 6. Ping. `npm ping` is the one `/-/` endpoint that is actually served, because unlike search,
+    //    audit and whoami below it does not degrade gracefully on a 404 — npm reads that as a broken
+    //    registry rather than "nothing to report". Never touches `upstream`: a proxy repository
+    //    answers for itself here, the same stance the hosted repository takes, rather than pinging
+    //    npmjs on every client's behalf.
+    router
+        .headWithRegex(NpmPaths.ping(base))
+        .blockingHandler(guarded("head ping", rc -> ping(rc, false)), false);
+    router
+        .getWithRegex(NpmPaths.ping(base))
+        .blockingHandler(guarded("get ping", rc -> ping(rc, true)), false);
+
+    // 7. Everything else under the base — /-/v1/search, /-/npm/v1/security/audits, /-/whoami, the
     //    login handshake — is a JSON 404, never Vert.x' default HTML page. npm degrades gracefully
-    //    on all of them: a search 404s to "no results", an audit 404s to "not audited", and an
-    //    install proceeds. That is why they are absent rather than stubbed.
+    //    on all of them, ping excepted above: a search 404s to "no results", an audit 404s to "not
+    //    audited", and an install proceeds. That is why they are absent rather than stubbed.
     router.route(base).handler(this::notFound);
     router.route(base + "/*").handler(this::notFound);
   }
 
   private void notFound(RoutingContext rc) {
     NpmErrors.send(rc, 404, "not a route this npm registry serves: " + rc.normalizedPath());
+  }
+
+  // --- ping ---------------------------------------------------------------------------------------
+
+  /**
+   * {@code GET|HEAD /artifacts/npm/<repo>/-/ping} — {@code npm ping}'s {@code ?write=true} included,
+   * though the query string is never read: the answer does not depend on it.
+   *
+   * <p>The whole contract is a non-5xx status, and {@code {}} is what npmjs itself answers, so there
+   * is nothing here for a hosted repository and a proxy to disagree about — the one check is that
+   * {@code repository} names a real npm repository, the same guard every other route opens with.
+   */
+  private void ping(RoutingContext rc, boolean withBody) {
+    registry.requireNpmRepository(rc.pathParam("repository"));
+    HttpServerResponse response =
+        rc.response()
+            .putHeader(HttpHeaders.CONTENT_TYPE, "application/json; charset=utf-8")
+            .putHeader(HttpHeaders.CONTENT_LENGTH, "2");
+    if (!withBody) {
+      response.end();
+      return;
+    }
+    response.end("{}");
   }
 
   // --- packuments -------------------------------------------------------------------------------

@@ -130,6 +130,20 @@ class NpmPathsTest {
     assertFalse(matches(NpmPaths.DIST_TAG, tags + "/-leading-dash"));
   }
 
+  // --- ping -------------------------------------------------------------------------------------
+
+  @Test
+  void aPingPathMatchesPingAndNothingElse() {
+    String path = "/artifacts/npm/npm/-/ping";
+    assertEquals("npm", group(NpmPaths.ping(NpmPaths.BASE), path, "repository"));
+
+    // A package name may not start with `-`, so this can never be read as one — the same property
+    // DIST_TAGS rests on.
+    assertFalse(matches(NpmPaths.PACKUMENT, path));
+    assertFalse(matches(NpmPaths.TARBALL, path));
+    assertFalse(matches(NpmPaths.DIST_TAGS, path));
+  }
+
   @Test
   void theProtocolSideEndpointsMissBothRoutesAndReachTheCatchAll() {
     // Search, audit, whoami, login. npm degrades gracefully on a 404 for every one of them, which

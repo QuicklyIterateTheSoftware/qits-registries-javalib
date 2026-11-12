@@ -139,6 +139,15 @@ class NpmMirrorMountTest {
   }
 
   @Test
+  void pingAnswersOkOnTheMirrorMount() {
+    try (NpmClient npm = client()) {
+      HttpResponse<String> answered = npm.get("mirror/npm/" + PROXY + "/-/ping");
+      assertEquals(200, answered.statusCode());
+      assertEquals("{}", answered.body());
+    }
+  }
+
+  @Test
   void anUnknownPathUnderTheMirrorMountIsTheRegistrysJson404() {
     try (NpmClient npm = client()) {
       HttpResponse<String> miss = npm.get("mirror/npm/npmjs/-/v1/search?text=left-pad");
