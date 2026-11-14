@@ -115,9 +115,9 @@ public class BlobCompaction {
    *       over the partition's on-disk size.
    *   <li>A segment larger than twice {@code qits.artifacts.blobs.segment-size} is never drained
    *       whole, whatever its live share: it is <b>shrunk from its tail</b> instead, by at most
-   *       {@code qits.artifacts.blobs.compaction.shrink-budget} (default 1 GiB) per run. The owned
-   *       chunks whose bytes sit in the last budget's worth of its TOAST relation move into the open
-   *       segment, and a VACUUM of the partition cuts the emptied pages off its end. Found live on
+   *       {@code qits.artifacts.blobs.compaction.shrink-budget} (default 1 GiB) of moved chunks per
+   *       run. Its newest owned chunks by heap order, a budget's worth, move into the open segment,
+   *       and a VACUUM of the partition cuts the emptied pages off its end. Found live on
    *       the first day of segments: the upgrade attaches the whole old table as segment 0 — 20 GB
    *       and 92% live on dev — which the ratio rule would leave alone until it fell under half live,
    *       giving back nothing for every blob deleted from it meanwhile (and no longer even reusing
