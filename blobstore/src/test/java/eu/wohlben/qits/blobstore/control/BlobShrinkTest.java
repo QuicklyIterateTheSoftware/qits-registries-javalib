@@ -6,7 +6,6 @@ import static eu.wohlben.qits.blobstore.control.ShrinkProfile.SEGMENT;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import eu.wohlben.qits.blobstore.control.BlobCompaction.CompactionResult;
@@ -43,7 +42,10 @@ class BlobShrinkTest extends SegmentTestSupport {
     compaction.compact();
   }
 
-  /** A big closed segment: its blobs, in the order their bytes sit in its TOAST relation. */
+  /**
+   * A big closed segment: its blobs, in the order their rows sit in its heap and their bytes in its
+   * TOAST relation.
+   */
   private record Big(int segment, List<BlobStore.StagedBlob> blobs) {}
 
   /**
@@ -105,10 +107,12 @@ class BlobShrinkTest extends SegmentTestSupport {
     assertEquals(1, result.segmentsShrunk(), result.toString());
     assertEquals(0, result.segmentsDrained(), "an oversized segment is never drained whole");
     assertTrue(partitionExists(big.segment()));
-    // The tail is a budget of TOAST pages; the truncation reaches down to the last live tuple, so it
-    // can also take a dead blob or two just below the tail, and never much more.
+    // The budget counts the live chunks that move, and two in three are live, so the tail spans
+    // about one and a half budgets — the dead third between them comes back for free. The
+    // truncation reaches down to the last live tuple, so it can also take a dead blob just below
+    // the tail, and never much more.
     assertTrue(
-        before - after >= BUDGET - CHUNK && before - after <= BUDGET + 4L * CHUNK,
+        before - after >= BUDGET * 3 / 2 - CHUNK && before - after <= BUDGET * 3 / 2 + 2L * CHUNK,
         "one run returns about a budget: " + before + " -> " + after + ", " + result);
     assertTrue(result.bytesTruncated() >= BUDGET - CHUNK, result.toString());
     assertTrue(
@@ -131,9 +135,10 @@ class BlobShrinkTest extends SegmentTestSupport {
     List<String> kept = new ArrayList<>();
     for (int i = 0; i < BLOBS; i++) {
       String blobId = big.blobs().get(i).sha256();
-      // One in five live, the first four of each five dead: whatever head the shrinks leave, it
-      // ends on a live blob and is a fifth live, so the ratio rule drains it once it is small.
-      if (i % 5 == 4) {
+      // The budget counts live bytes, so a tail of three budgets' worth must be live for three
+      // shrinks: the top 24 are, and of the head below them one in five, the first four of each
+      // five dead. The last run takes what is left of the head, which empties the segment.
+      if (i >= BLOBS - 3 * (int) (BUDGET / CHUNK) || i % 5 == 4) {
         kept.add(blobId);
       } else {
         reclaim(blobId);
@@ -218,22 +223,39 @@ class BlobShrinkTest extends SegmentTestSupport {
     }
   }
 
+  /**
+   * qits-2248, found live: the first cut of the shrink read the partition's TOAST relation, which
+   * a superuser may and the service's role — the tables' owner, not a superuser — may not. The
+   * suite connects as such a role; this pins that it still does, and that the tail is chosen from
+   * the partition's own heap.
+   */
   @Test
-  void theTailIsReadByATidRangeScan() throws Exception {
+  void theTailIsChosenFromTheHeapByTheTablesOwnerNotASuperuser() throws Exception {
     Big big = bigSegment(50_000, Set.of());
-    BlobSegments.Toast toast = segments.toastOf("blob_chunk_" + big.segment());
-    assertNotNull(toast);
-    assertTrue(toast.pages() > 0);
-    String sql =
-        BlobSegments.tailValuesSql(toast.name(), toast.pages() - BUDGET / toast.blockSize());
-    StringBuilder plan = new StringBuilder();
+    String partition = "blob_chunk_" + big.segment();
     try (Connection connection = blobs.getConnection();
-        Statement explain = connection.createStatement();
-        ResultSet rows = explain.executeQuery("explain " + sql)) {
-      while (rows.next()) {
-        plan.append(rows.getString(1)).append('\n');
+        Statement sql = connection.createStatement()) {
+      try (ResultSet role =
+          sql.executeQuery(
+              "select r.rolsuper, c.relowner = r.oid from pg_roles r, pg_class c"
+                  + " where r.rolname = current_user and c.oid = '"
+                  + partition
+                  + "'::regclass")) {
+        assertTrue(role.next());
+        assertFalse(role.getBoolean(1), "the suite must not connect as a superuser");
+        assertTrue(role.getBoolean(2), "the suite's role owns the blob tables, as in production");
       }
+      StringBuilder plan = new StringBuilder();
+      try (ResultSet rows =
+          sql.executeQuery(
+              "explain "
+                  + BlobSegments.tailChunksSql(partition).replace("?", String.valueOf(BUDGET)))) {
+        while (rows.next()) {
+          plan.append(rows.getString(1)).append('\n');
+        }
+      }
+      assertTrue(plan.toString().contains("on " + partition), "reads the heap:\n" + plan);
+      assertFalse(plan.toString().contains("pg_toast"), "reads no TOAST relation:\n" + plan);
     }
-    assertTrue(plan.toString().contains("Tid Range Scan"), "reads the tail pages only:\n" + plan);
   }
 }

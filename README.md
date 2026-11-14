@@ -102,10 +102,12 @@ failed on it live: on dev it was 20 GB and 92% live, so compaction left it alone
 deleted from it gave back nothing, and since new chunks go only into the open segment the space those
 deletes freed was not even reused any more, as it had been before the upgrade. Waiting for it to fall
 under half live would also have needed half of it free at once for the drain. So each run shrinks it
-from the tail instead, by at most `qits.artifacts.blobs.compaction.shrink-budget` (1 GiB): the owned
-chunks whose bytes sit in the last budget's worth of its TOAST relation (found with a TID range scan,
-mapped through `pg_column_toast_chunk_id`, PostgreSQL 17+) move into the open segment, and a
-`VACUUM (TRUNCATE true, SKIP_LOCKED true)` of the partition cuts the emptied pages off its end. The disk comes back a
+from the tail instead, a `qits.artifacts.blobs.compaction.shrink-budget` (1 GiB) of moved chunks per
+run: its owned chunks with the highest heap `ctid`, a budget of their stored size, move into the open
+segment, and a `VACUUM (TRUNCATE true, SKIP_LOCKED true)` of the partition cuts the emptied pages off
+its end. The heap stands for the TOAST relation the bytes live in, because a chunk's heap row and its
+TOAST value are written together; the TOAST relation itself is never read — its schema grants a
+non-superuser owner, which a service role is, no access. The disk comes back at least a
 budget per gc run, at the price of moving about that much; once the segment is down to twice the
 segment size the ratio rule takes it over. A STAGING upload in the tail, a long-running transaction
 elsewhere (whose snapshot keeps the moved chunks' old copies alive) or a truncation lock VACUUM could
