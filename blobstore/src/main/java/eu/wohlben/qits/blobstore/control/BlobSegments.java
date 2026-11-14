@@ -175,7 +175,8 @@ class BlobSegments {
    *
    * <p>One retry, for one reason: the schema changed under this process. A replica that detected
    * the old schema keeps omitting the segment after a consumer migrates, and the first such insert
-   * fails on the column's NOT NULL — which is the cue to look again and write it the new way. The
+   * fails — no partition takes a NULL segment — which is the cue to look again and write it the new
+   * way. The
    * opposite case, a segmented insert that finds no partition for the segment it read, cannot happen
    * while the drop holds the parent lock as {@link #compact} does, and is retried all the same
    * because a failed insert wrote nothing and a second one reads the open segment afresh.
@@ -222,11 +223,14 @@ class BlobSegments {
       return false;
     }
     String state = sql.getSQLState();
+    // Unsegmented, against a table that is partitioned now: the missing segment is NULL, and the
+    // routing that finds no partition for NULL fails before the NOT NULL check would — so either
+    // state can be the one that arrives.
     return asSegmented
         ? CHECK_VIOLATION.equals(state)
             || UNDEFINED_TABLE.equals(state)
             || UNDEFINED_COLUMN.equals(state)
-        : NOT_NULL_VIOLATION.equals(state);
+        : NOT_NULL_VIOLATION.equals(state) || CHECK_VIOLATION.equals(state);
   }
 
   /**
@@ -383,10 +387,13 @@ class BlobSegments {
         continue;
       }
       if (!empty) {
-        moved += drain(closed.segment());
-        drained++;
-        // The drained bytes landed in the open segment, which may now be past its size.
-        rollIfFull();
+        long movedHere = drain(closed.segment());
+        if (movedHere > 0) {
+          moved += movedHere;
+          drained++;
+          // The drained bytes landed in the open segment, which may now be past its size.
+          rollIfFull();
+        }
       }
       if (dropIfEmpty(closed)) {
         dropped++;
