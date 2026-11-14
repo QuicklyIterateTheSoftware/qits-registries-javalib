@@ -1,0 +1,239 @@
+package eu.wohlben.qits.blobstore.control;
+
+import static eu.wohlben.qits.blobstore.control.ShrinkProfile.BUDGET;
+import static eu.wohlben.qits.blobstore.control.ShrinkProfile.CHUNK;
+import static eu.wohlben.qits.blobstore.control.ShrinkProfile.SEGMENT;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import eu.wohlben.qits.blobstore.control.BlobCompaction.CompactionResult;
+import io.quarkus.test.junit.QuarkusTest;
+import io.quarkus.test.junit.TestProfile;
+import jakarta.inject.Inject;
+import java.io.ByteArrayInputStream;
+import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+/**
+ * qits-2248, found live: an oversized closed segment — segment 0 after the upgrade, 20 GB and 92%
+ * live on dev — is never drained whole, so without a shrink every blob deleted from it returned
+ * nothing. Compaction cuts such a segment down from its tail, a budget per run, whatever its live
+ * share.
+ */
+@QuarkusTest
+@TestProfile(ShrinkProfile.class)
+class BlobShrinkTest extends SegmentTestSupport {
+
+  private static final int BLOBS = 40;
+
+  @Inject BlobSegments segments;
+
+  /** Drops the segments the base reset emptied, so each case sees only its own. */
+  @BeforeEach
+  void dropEmptiedSegments() {
+    compaction.compact();
+  }
+
+  /** A big closed segment: its blobs, in the order their bytes sit in its TOAST relation. */
+  private record Big(int segment, List<BlobStore.StagedBlob> blobs) {}
+
+  /**
+   * Stages {@link #BLOBS} 1 MiB blobs into one fresh segment — staging never rolls, so they all
+   * land there, appended in order — then promotes all but {@code staying} and closes the segment.
+   */
+  private Big bigSegment(int seedBase, Set<Integer> staying) {
+    segments.roll(openSegment());
+    int segment = openSegment();
+    List<BlobStore.StagedBlob> staged = new ArrayList<>();
+    for (int i = 0; i < BLOBS; i++) {
+      staged.add(
+          blobStore.stage(
+              new ByteArrayInputStream(BlobStoreTest.noise(CHUNK, seedBase + i)), Long.MAX_VALUE));
+    }
+    for (int i = 0; i < BLOBS; i++) {
+      if (!staying.contains(i)) {
+        assertFalse(blobStore.promote(staged.get(i)));
+      }
+    }
+    if (openSegment() == segment) {
+      segments.roll(segment);
+    }
+    assertTrue(openSegment() > segment, "the big segment must be closed");
+    assertTrue(
+        diskBytes(segment) > 8 * SEGMENT, "the segment must be far past twice the segment size");
+    return new Big(segment, staged);
+  }
+
+  private long diskBytes(int segment) {
+    return count("select pg_total_relation_size('blob_chunk_" + segment + "')");
+  }
+
+  private long blobTablesBytes() {
+    return count(
+        "select (select sum(pg_total_relation_size(relid)) from pg_partition_tree('blob_chunk'))"
+            + " + pg_total_relation_size('blob') + pg_total_relation_size('blob_content')"
+            + " + pg_total_relation_size('blob_segment')");
+  }
+
+  @Test
+  void oneRunCutsAboutOneBudgetOffTheTailOfAPartlyDeadSegment() throws Exception {
+    Big big = bigSegment(10_000, Set.of());
+    List<String> kept = new ArrayList<>();
+    for (int i = 0; i < BLOBS; i++) {
+      String blobId = big.blobs().get(i).sha256();
+      if (i % 3 == 1) {
+        reclaim(blobId);
+      } else {
+        kept.add(blobId);
+      }
+    }
+    long before = diskBytes(big.segment());
+
+    CompactionResult result = compaction.compact();
+
+    long after = diskBytes(big.segment());
+    assertEquals(CompactionResult.State.COMPACTED, result.state());
+    assertEquals(1, result.segmentsShrunk(), result.toString());
+    assertEquals(0, result.segmentsDrained(), "an oversized segment is never drained whole");
+    assertTrue(partitionExists(big.segment()));
+    // The tail is a budget of TOAST pages; the truncation reaches down to the last live tuple, so it
+    // can also take a dead blob or two just below the tail, and never much more.
+    assertTrue(
+        before - after >= BUDGET - CHUNK && before - after <= BUDGET + 4L * CHUNK,
+        "one run returns about a budget: " + before + " -> " + after + ", " + result);
+    assertTrue(result.bytesTruncated() >= BUDGET - CHUNK, result.toString());
+    assertTrue(
+        result.bytesMoved() > 0 && result.bytesMoved() <= BUDGET + CHUNK,
+        "only the tail's live chunks move: " + result);
+    assertTrue(result.blobTablesBytesAfter() < result.blobTablesBytesBefore(), result.toString());
+
+    String last = big.blobs().get(BLOBS - 1).sha256();
+    String first = big.blobs().get(0).sha256();
+    assertNotEquals(big.segment(), segmentOfBlob(last), "the tail's blobs moved out");
+    assertEquals(big.segment(), segmentOfBlob(first), "the head's blobs stayed");
+    for (String blobId : kept) {
+      assertServedIntact(blobId);
+    }
+  }
+
+  @Test
+  void repeatedRunsEmptyAndDropTheSegmentAndTheDiskFallsToTheLiveData() throws Exception {
+    Big big = bigSegment(20_000, Set.of());
+    List<String> kept = new ArrayList<>();
+    for (int i = 0; i < BLOBS; i++) {
+      String blobId = big.blobs().get(i).sha256();
+      // One in five live, the first four of each five dead: whatever head the shrinks leave, it
+      // ends on a live blob and is a fifth live, so the ratio rule drains it once it is small.
+      if (i % 5 == 4) {
+        kept.add(blobId);
+      } else {
+        reclaim(blobId);
+      }
+    }
+    long live = (long) kept.size() * CHUNK;
+
+    long moved = 0;
+    int shrunk = 0;
+    int runs = 0;
+    while (partitionExists(big.segment()) && runs < 12) {
+      long sizeBefore = diskBytes(big.segment());
+      CompactionResult result = compaction.compact();
+      runs++;
+      moved += result.bytesMoved();
+      shrunk += result.segmentsShrunk();
+      if (partitionExists(big.segment())) {
+        assertTrue(
+            diskBytes(big.segment()) < sizeBefore, "every run must take something off: " + result);
+      }
+    }
+
+    assertFalse(partitionExists(big.segment()), "emptied and dropped within " + runs + " runs");
+    assertTrue(shrunk >= 3, "shrunk a budget at a time first, " + shrunk + " in " + runs + " runs");
+    assertEquals(live, moved, "every live chunk moved exactly once, and nothing else");
+    // Left: the live chunks in the segments they moved into (each up to a segment plus a blob), with
+    // their TOAST overhead, heaps and indexes.
+    assertTrue(
+        blobTablesBytes() <= live + 2 * SEGMENT,
+        "the blob tables fall to about the live data: " + blobTablesBytes() + " for " + live);
+    for (String blobId : kept) {
+      assertServedIntact(blobId);
+    }
+  }
+
+  @Test
+  void aFullyLiveOversizedSegmentStillShrinks() throws Exception {
+    // The live case: segment 0 was 92% live, which the ratio rule never touches.
+    Big big = bigSegment(30_000, Set.of());
+    long before = diskBytes(big.segment());
+
+    CompactionResult result = compaction.compact();
+
+    assertEquals(1, result.segmentsShrunk(), result.toString());
+    assertTrue(before - diskBytes(big.segment()) >= BUDGET - CHUNK, result.toString());
+    assertTrue(
+        result.bytesMoved() >= BUDGET - CHUNK && result.bytesMoved() <= BUDGET + CHUNK,
+        "a live tail moves about a budget: " + result);
+    for (BlobStore.StagedBlob blob : big.blobs()) {
+      assertServedIntact(blob.sha256());
+    }
+  }
+
+  @Test
+  void aStagingUploadInTheTailStaysAndHoldsOnlyWhatIsBelowIt() throws Exception {
+    // Low enough in the tail that what lies above it is worth a truncation to VACUUM: it truncates
+    // only when at least 1000 pages or a sixteenth of the relation can go.
+    int staging = BLOBS - 6;
+    Big big = bigSegment(40_000, Set.of(staging));
+    BlobStore.StagedBlob upload = big.blobs().get(staging);
+    long before = diskBytes(big.segment());
+
+    CompactionResult result = compaction.compact();
+
+    assertEquals(CompactionResult.State.COMPACTED, result.state());
+    assertEquals(big.segment(), segmentOf(upload.contentId()), "STAGING chunks are never moved");
+    assertNotEquals(
+        big.segment(), segmentOfBlob(big.blobs().get(BLOBS - 1).sha256()), "the rest moved");
+    long cut = before - diskBytes(big.segment());
+    assertTrue(
+        cut > 0 && cut < BUDGET - CHUNK,
+        "truncated down to the upload's bytes and no further: " + cut + ", " + result);
+
+    // Promoted, it is ordinary content: the next run moves it and the tail goes on shrinking.
+    assertFalse(blobStore.promote(upload));
+    long held = diskBytes(big.segment());
+    CompactionResult next = compaction.compact();
+    assertNotEquals(big.segment(), segmentOfBlob(upload.sha256()));
+    assertTrue(diskBytes(big.segment()) < held, next.toString());
+    for (BlobStore.StagedBlob blob : big.blobs()) {
+      assertServedIntact(blob.sha256());
+    }
+  }
+
+  @Test
+  void theTailIsReadByATidRangeScan() throws Exception {
+    Big big = bigSegment(50_000, Set.of());
+    BlobSegments.Toast toast = segments.toastOf("blob_chunk_" + big.segment());
+    assertNotNull(toast);
+    assertTrue(toast.pages() > 0);
+    String sql =
+        BlobSegments.tailValuesSql(toast.name(), toast.pages() - BUDGET / toast.blockSize());
+    StringBuilder plan = new StringBuilder();
+    try (Connection connection = blobs.getConnection();
+        Statement explain = connection.createStatement();
+        ResultSet rows = explain.executeQuery("explain " + sql)) {
+      while (rows.next()) {
+        plan.append(rows.getString(1)).append('\n');
+      }
+    }
+    assertTrue(plan.toString().contains("Tid Range Scan"), "reads the tail pages only:\n" + plan);
+  }
+}
