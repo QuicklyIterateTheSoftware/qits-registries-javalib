@@ -279,7 +279,10 @@ class BlobCompactionTest extends SegmentTestSupport {
       threads.shutdownNow();
     }
 
-    assertTrue(failures.isEmpty(), "no writer, sweeper or compaction may fail: " + failures);
+    assertTrue(
+        failures.isEmpty(),
+        "no writer, sweeper or compaction may fail: "
+            + failures.stream().map(BlobCompactionTest::withCauses).toList());
     assertTrue(openSegment() > segmentAtStart + 2, "the segment must have rolled repeatedly");
     assertTrue(compactions.get() > 0, "and compaction must have run alongside");
     compaction.compact();
@@ -298,6 +301,19 @@ class BlobCompactionTest extends SegmentTestSupport {
         count("select count(distinct content_id) from blob_chunk")
             >= kept.size(),
         "the kept blobs' chunks are all still there");
+  }
+
+  /** A failure with its whole cause chain — the SQLSTATE is in the innermost one. */
+  private static String withCauses(Throwable failure) {
+    StringBuilder text = new StringBuilder();
+    for (Throwable t = failure; t != null; t = t.getCause()) {
+      text.append(t.getClass().getSimpleName()).append(": ").append(t.getMessage());
+      if (t instanceof java.sql.SQLException sql) {
+        text.append(" [SQLSTATE ").append(sql.getSQLState()).append(']');
+      }
+      text.append(t.getCause() == null ? "" : " <- ");
+    }
+    return text.toString();
   }
 
   @Test
