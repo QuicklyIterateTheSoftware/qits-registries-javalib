@@ -26,10 +26,28 @@ import java.sql.Statement;
  */
 public final class EmbeddedPg {
 
-  /** Zonky's superuser. Its authentication is `trust`, so the password below is a placeholder. */
-  public static final String USER = "postgres";
+  /**
+   * The role every test connects as: a login that OWNS the test databases and so the blob tables in
+   * them, and is NOT a superuser — the shape of a consumer's service role in production.
+   *
+   * <p>qits-2248, found live: the tail shrink read the partition's TOAST relation directly, which
+   * the suite's superuser could and the service's role cannot — {@code permission denied for schema
+   * pg_toast}, because a table's owner is granted no USAGE on {@code pg_toast}. A suite that connects
+   * as a superuser passes every privilege check there is, so it can never see a defect of that class;
+   * connecting as an ordinary owner is what makes it see them.
+   */
+  public static final String USER = "blobstore";
 
-  /** Any string does: the embedded instance trusts local connections. Never a real credential. */
+  /**
+   * Zonky's superuser: it creates {@link #USER} and the databases, and nothing else connects as it.
+   * A test that genuinely needs superuser access must ask for {@link #connectAsSuperuser} by name.
+   */
+  public static final String SUPERUSER = "postgres";
+
+  /**
+   * Any string does: the embedded instance trusts local connections, for every role. Never a real
+   * credential.
+   */
   public static final String PASSWORD = "embedded";
 
   /** Where the running instance's port is published for the other classloaders. */
@@ -63,6 +81,7 @@ public final class EmbeddedPg {
     }
     System.setProperty(PORT_PROPERTY, String.valueOf(started.getPort()));
     Runtime.getRuntime().addShutdownHook(new Thread(EmbeddedPg::stop, "embedded-pg-stop"));
+    ensureRole();
     return started.getPort();
   }
 
@@ -80,8 +99,21 @@ public final class EmbeddedPg {
    * driver") — naming the driver directly works from every classloader that can see the class.
    */
   public static Connection connect(String url) throws java.sql.SQLException {
+    return connect(url, USER);
+  }
+
+  /**
+   * A superuser connection, for the setup only a superuser may do — the role and the databases.
+   * Never the way a test reaches the blob tables: whatever the store does must work for {@link
+   * #USER}.
+   */
+  public static Connection connectAsSuperuser(String url) throws java.sql.SQLException {
+    return connect(url, SUPERUSER);
+  }
+
+  private static Connection connect(String url, String user) throws java.sql.SQLException {
     java.util.Properties credentials = new java.util.Properties();
-    credentials.setProperty("user", USER);
+    credentials.setProperty("user", user);
     credentials.setProperty("password", PASSWORD);
     return new org.postgresql.Driver().connect(url, credentials);
   }
@@ -90,8 +122,32 @@ public final class EmbeddedPg {
     return "jdbc:postgresql://localhost:" + port() + "/postgres";
   }
 
+  /**
+   * Creates {@link #USER} if it is new. Asked of the catalog rather than remembered: the instance is
+   * shared by every classloader of the JVM, and each loads its own copy of this class.
+   */
+  private static void ensureRole() {
+    try (Connection admin = connectAsSuperuser(adminUrl());
+        Statement sql = admin.createStatement()) {
+      try (ResultSet found =
+          sql.executeQuery("select 1 from pg_roles where rolname = '" + USER + "'")) {
+        if (found.next()) {
+          return;
+        }
+      }
+      sql.execute("create role " + USER + " login nosuperuser nocreatedb nocreaterole");
+    } catch (Exception e) {
+      throw new IllegalStateException("could not create the test role " + USER, e);
+    }
+  }
+
+  /**
+   * Creates the database OWNED by {@link #USER}. On PostgreSQL 15 and later its {@code public}
+   * schema belongs to {@code pg_database_owner}, so the owner role creates the blob tables there —
+   * and owns them — with no grant beyond that.
+   */
   private static void ensureDatabase(String database) {
-    try (Connection admin = connect(adminUrl());
+    try (Connection admin = connectAsSuperuser(adminUrl());
         Statement sql = admin.createStatement()) {
       try (ResultSet found =
           sql.executeQuery("select 1 from pg_database where datname = '" + database + "'")) {
@@ -99,7 +155,7 @@ public final class EmbeddedPg {
           return;
         }
       }
-      sql.execute("create database " + database);
+      sql.execute("create database " + database + " owner " + USER);
     } catch (Exception e) {
       throw new IllegalStateException("could not create the test database " + database, e);
     }

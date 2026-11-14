@@ -19,6 +19,9 @@ import org.eclipse.microprofile.config.spi.ConfigSource;
  * mirror}, {@code githost} — resolved by name from {@code qits.artifacts.blobs-datasource}. Testing
  * against the default datasource would leave that lookup, the one genuinely new piece of wiring,
  * unexercised.
+ *
+ * <p>The username is {@link EmbeddedPg#USER}, the owner of the blob tables and not a superuser — as a
+ * consumer's service role is. See there for the defect a superuser here once hid.
  */
 public class EmbeddedPgConfigSource implements ConfigSource {
 
