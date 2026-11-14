@@ -43,7 +43,9 @@ import org.jboss.logging.Logger;
  * <ul>
  *   <li><b>A chunk insert names its segment in the statement that writes it</b> — {@code
  *       (select segment from blob_segment)} in the {@code VALUES} — so there is no window between
- *       choosing a segment and writing into it beyond one statement's own snapshot.
+ *       choosing a segment and writing into it beyond one statement's own snapshot. A roll holds
+ *       {@code blob_segment} exclusively while it attaches the next partition, so a statement that
+ *       reads the new number always routes against a partition list that contains it.
  *   <li><b>A compaction run never drains the segment that was open when it started</b>, nor any
  *       later one. A writer whose statement read the old open number before a roll committed is
  *       therefore always writing into a segment this run leaves alone.
@@ -176,10 +178,10 @@ class BlobSegments {
    * <p>One retry, for one reason: the schema changed under this process. A replica that detected
    * the old schema keeps omitting the segment after a consumer migrates, and the first such insert
    * fails — no partition takes a NULL segment — which is the cue to look again and write it the new
-   * way. The
-   * opposite case, a segmented insert that finds no partition for the segment it read, cannot happen
-   * while the drop holds the parent lock as {@link #compact} does, and is retried all the same
-   * because a failed insert wrote nothing and a second one reads the open segment afresh.
+   * way. The opposite case, a segmented insert that finds no partition for the segment it read,
+   * cannot happen while a roll holds {@code blob_segment} exclusively (see {@link #roll}) and a drop
+   * holds the parent lock (see {@link #compact}), and is retried all the same because a failed
+   * insert wrote nothing and a second one, in a fresh statement, sees the partitions afresh.
    */
   void insertChunk(UUID contentId, int seq, byte[] bytes) {
     boolean asSegmented = segmented();
@@ -296,6 +298,17 @@ class BlobSegments {
    * the primary key, so ATTACH adopts that key as the partition's half of the parent's and clones
    * the foreign key onto an empty table — nothing to validate.
    *
+   * <p><b>But the weak lock opens a race, and {@code blob_segment} closes it.</b> Because ATTACH
+   * does not conflict with a writer's lock on the parent, a chunk insert can take that lock — and
+   * with it the parent's partition list — before the roll commits, then take its snapshot after,
+   * read the NEW open segment, and find no partition for it in the list it holds ("no partition of
+   * relation found for row"). Measured: nine such inserts in forty runs of the concurrency suite.
+   * So the roll first takes ACCESS EXCLUSIVE on {@code blob_segment} itself and holds it to the
+   * commit. Every statement that names the open segment reads that table, so it queues there; and
+   * a lock granted after waiting processes the invalidations the roll's commit sent, so the parent's
+   * partition list it then routes against already includes the new partition. Chunk inserts pause
+   * for the few milliseconds a roll takes; chunk reads never touch {@code blob_segment} and do not.
+   *
    * <p>Under a store-wide advisory lock, and only if {@code blob_segment} still says {@code from}:
    * every replica's promotes see the same full segment, and exactly one of them rolls.
    *
@@ -311,8 +324,10 @@ class BlobSegments {
               try (Statement sql = connection.createStatement()) {
                 sql.execute("set local lock_timeout = '" + LOCK_TIMEOUT + "'");
                 lockNamed(connection, ROLL_LOCK);
-                try (ResultSet row =
-                    sql.executeQuery("select segment from blob_segment for update")) {
+                // Before the attach, and held to the commit: see the method comment for why every
+                // reader of the open segment must queue behind the whole roll.
+                sql.execute("lock table blob_segment in access exclusive mode");
+                try (ResultSet row = sql.executeQuery("select segment from blob_segment")) {
                   if (!row.next() || row.getInt(1) != from) {
                     return false;
                   }
