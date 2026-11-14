@@ -13,7 +13,7 @@ import java.util.UUID;
  */
 final class StagingChunks {
 
-  private final BlobDb db;
+  private final BlobSegments segments;
   private final UUID contentId;
   private final int chunkSize;
   private final byte[] buffer;
@@ -23,8 +23,8 @@ final class StagingChunks {
   private long written;
   private long flushed;
 
-  StagingChunks(BlobDb db, UUID contentId, int chunkSize) {
-    this.db = db;
+  StagingChunks(BlobSegments segments, UUID contentId, int chunkSize) {
+    this.segments = segments;
     this.contentId = contentId;
     this.chunkSize = chunkSize;
     this.buffer = new byte[chunkSize];
@@ -91,7 +91,7 @@ final class StagingChunks {
   }
 
   private void flush() {
-    BlobChunks.insert(db, contentId, nextSeq, buffer, buffered);
+    BlobChunks.insert(segments, contentId, nextSeq, buffer, buffered);
     nextSeq++;
     flushed += buffered;
     buffered = 0;

@@ -36,10 +36,16 @@ import org.jboss.logging.Logger;
  *
  * <p>Bytes are 1 MiB {@code blob_chunk} rows under a surrogate content id; a {@code blob} row binds
  * the SHA-256 address to one content. <b>PostgreSQL is the only backend</b> — there is no
- * filesystem path, no temp directory and no fallback. The three tables ship as reference DDL at
- * {@code db/blobstore-tables.sql}, which each consumer copies into its own Flyway lineage, and the
- * datasource that reaches them is named by {@code qits.artifacts.blobs-datasource} (see {@link
- * BlobDb} for why a config key rather than an injected qualifier).
+ * filesystem path, no temp directory and no fallback. The tables ship as reference DDL at {@code
+ * db/blobstore-tables.sql} (and {@code db/blobstore-segments-upgrade.sql} for a store created before
+ * segments), which each consumer copies into its own Flyway lineage, and the datasource that reaches
+ * them is named by {@code qits.artifacts.blobs-datasource} (see {@link BlobDb} for why a config key
+ * rather than an injected qualifier).
+ *
+ * <p><b>Chunks live in segments</b> — partitions of {@code blob_chunk} that can be dropped whole,
+ * which is the only way PostgreSQL gives disk back without rewriting a table. Which segment a chunk
+ * is written to, when the open one is closed, and how deleted space returns to the filesystem are
+ * {@link BlobSegments}'s; this class only tells it when a promote has stored something new.
  *
  * <p><b>Staging lives in the database too.</b> A stage is a {@code STAGING} content id accumulating
  * chunks; promote inserts the {@code blob} row and flips the state, moving no bytes; a dedupe drops
@@ -48,7 +54,8 @@ import org.jboss.logging.Logger;
  * and what {@link #sweepAbandonedStaging} exists for.
  *
  * <p><b>Writes and reads never hold a transaction open.</b> Chunk statements are autocommit
- * singles; only {@link #promote} and {@link #delete} open one, and both are short by construction.
+ * singles; only {@link #promote} and {@link #delete} open one, and both are short by construction
+ * (the segment work in {@link BlobSegments} opens its own, each as short).
  * A 1 GiB push is 1024 tiny transactions rather than one long one, so nothing pins a connection or
  * holds back the WAL visibility horizon while a client is slow.
  *
@@ -66,6 +73,8 @@ public class BlobStore {
   static final int DEFAULT_CHUNK_SIZE = 1 << 20;
 
   @Inject BlobDb db;
+
+  @Inject BlobSegments segments;
 
   /**
    * Bytes per chunk row. 1 MiB is the size the store is designed around: a 1 GiB layer is 1024 round
@@ -352,6 +361,11 @@ public class BlobStore {
               return !inserted;
             });
     openStages.remove(staged.contentId());
+    if (!dedupe) {
+      // Outside the transaction above, deliberately: a roll is DDL and a parent lock, and promote's
+      // transaction holds this blob's advisory lock. It never throws — the blob is stored already.
+      segments.rollIfFull();
+    }
     return dedupe;
   }
 
@@ -543,7 +557,7 @@ public class BlobStore {
           }
           return null;
         });
-    return new StagingChunks(db, contentId, chunkSize);
+    return new StagingChunks(segments, contentId, chunkSize);
   }
 
   /** Removes a staging area. Guarded on the state, so it can never touch promoted content. */
@@ -564,8 +578,11 @@ public class BlobStore {
    * Takes this blob's advisory lock for the rest of the transaction. Keyed on the content address,
    * so two different blobs never wait on each other, and released by the commit — there is no
    * unlock to forget.
+   *
+   * <p>Package-private because compaction takes it too: moving a blob's chunks between segments is
+   * the third thing, after promote and delete, that must not interleave with either.
    */
-  private static void lockBlob(Connection connection, String blobId) throws SQLException {
+  static void lockBlob(Connection connection, String blobId) throws SQLException {
     try (PreparedStatement lock =
         connection.prepareStatement("select pg_advisory_xact_lock(hashtextextended(?, 0))")) {
       lock.setString(1, blobId);

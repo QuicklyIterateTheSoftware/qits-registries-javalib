@@ -26,7 +26,8 @@ import org.eclipse.microprofile.config.inject.ConfigProperty;
  * work: one connection borrow of microseconds each, so a 1 GiB push never holds one long
  * transaction pinning a connection and bloating the WAL-visibility horizon, and no chunk is ever a
  * megabyte-wide entity in a Hibernate session. Only {@code promote} and {@code delete} open a
- * transaction, and both are short by construction.
+ * transaction, and both are short by construction — as is each step of the segment work (a roll,
+ * one batch of a drain, one drop), which opens its own through {@link #inOwnTransaction}.
  *
  * <p><b>An ambient JTA transaction is honoured, not fought.</b> Quarkus enlists an Agroal
  * connection taken inside {@code @Transactional}, which arrives with autocommit already off — so
@@ -86,9 +87,42 @@ class BlobDb {
    * and this only runs the statements.
    */
   <T> T inTransaction(String what, SqlWork<T> work) {
+    return inTransaction(what, work, false);
+  }
+
+  /**
+   * Whether a connection borrowed here right now would arrive enlisted in a caller's JTA
+   * transaction — which is how Agroal hands one out inside {@code @Transactional}: autocommit off.
+   */
+  boolean callerTransactionActive() {
+    return autocommit("Failed to borrow a blob connection", connection -> !connection.getAutoCommit());
+  }
+
+  /**
+   * {@link #inTransaction}, but refusing to join a caller's transaction: the work runs only in a
+   * transaction this call opens and commits itself.
+   *
+   * <p>For the segment work — rolling to a new partition, draining one, dropping one. Those take
+   * table locks and run DDL, and inside a caller's transaction both would be held until that
+   * transaction ends, for a length nothing here controls. A dropped partition's files, too, are
+   * only unlinked at commit. So the segment work is refused outright inside one, and each caller
+   * decides what refusal means: the roll simply waits for the next promote; a compaction run is a
+   * programming error and says so.
+   *
+   * @throws IllegalStateException if the borrowed connection is enlisted in a caller's transaction
+   */
+  <T> T inOwnTransaction(String what, SqlWork<T> work) {
+    return inTransaction(what, work, true);
+  }
+
+  private <T> T inTransaction(String what, SqlWork<T> work, boolean refuseEnlisted) {
     try (Connection connection = dataSource().getConnection()) {
       boolean ours = connection.getAutoCommit();
       if (!ours) {
+        if (refuseEnlisted) {
+          throw new IllegalStateException(
+              what + ": refused inside a caller's transaction — this work commits on its own");
+        }
         return work.run(connection);
       }
       connection.setAutoCommit(false);

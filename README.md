@@ -83,9 +83,25 @@ environments, so a rename there is a live-config break rather than a source one.
 
 **No Flyway migrations, in any module.** A library does not own a schema; each consuming service
 does. The JPA entities travel as they are, so a service that owns the tables gets the same
-mappings. The three blob tables have no entities — the store speaks plain JDBC — so they ship as
+mappings. The blob tables have no entities — the store speaks plain JDBC — so they ship as
 reference DDL at `blobstore/src/main/resources/db/blobstore-tables.sql`, which each consumer copies
 into its own lineage.
+
+### Segments, and the one upgrade script (qits-2248)
+
+PostgreSQL never gives the space a delete frees back to the filesystem, so a store that reclaimed
+most of its blobs used to sit at its peak on disk for good. Since qits-2248 `blob_chunk` is
+list-partitioned by a `segment` number: chunks go into one open segment, the store rolls to a fresh
+partition once the open one passes `qits.artifacts.blobs.segment-size` (1 GiB), and `BlobCompaction`
+— called by a consumer's gc sweep after its deletions — moves the live chunks out of mostly-dead
+closed segments and drops their partitions, which is what returns the disk.
+
+A consumer whose tables predate this copies
+`blobstore/src/main/resources/db/blobstore-segments-upgrade.sql` verbatim into a migration of its
+own. It rewrites no chunk: the existing table becomes partition 0, attached as it is. **Bump the
+library first, migrate second** — the library detects the old schema and behaves exactly as before
+on it (compaction answers `UNSEGMENTED`), while a library older than qits-2248 cannot write to an
+upgraded schema at all.
 
 ## Building
 
