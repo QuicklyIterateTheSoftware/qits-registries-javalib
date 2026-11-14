@@ -102,17 +102,26 @@ failed on it live: on dev it was 20 GB and 92% live, so compaction left it alone
 deleted from it gave back nothing, and since new chunks go only into the open segment the space those
 deletes freed was not even reused any more, as it had been before the upgrade. Waiting for it to fall
 under half live would also have needed half of it free at once for the drain. So each run shrinks it
-from the tail instead, a `qits.artifacts.blobs.compaction.shrink-budget` (1 GiB) of moved chunks per
-run: its owned chunks with the highest heap `ctid`, a budget of their stored size, move into the open
-segment, and a `VACUUM (TRUNCATE true, SKIP_LOCKED true)` of the partition cuts the emptied pages off
-its end. The heap stands for the TOAST relation the bytes live in, because a chunk's heap row and its
-TOAST value are written together; the TOAST relation itself is never read — its schema grants a
-non-superuser owner, which a service role is, no access. The disk comes back at least a
+from the tail instead, by at most `qits.artifacts.blobs.compaction.shrink-budget` (1 GiB): the owned
+chunks whose bytes sit in the last budget's worth of its TOAST relation (found with a TID range scan,
+mapped through `pg_column_toast_chunk_id`, PostgreSQL 17+) move into the open segment, and a
+`VACUUM (TRUNCATE true, SKIP_LOCKED true)` of the partition cuts the emptied pages off its end. The disk comes back a
 budget per gc run, at the price of moving about that much; once the segment is down to twice the
 segment size the ratio rule takes it over. A STAGING upload in the tail, a long-running transaction
 elsewhere (whose snapshot keeps the moved chunks' old copies alive) or a truncation lock VACUUM could
 not get only delays the return to a later run. `CompactionResult` reports it as `segmentsShrunk` and
 `bytesTruncated`.
+
+The shrink needs the exact TOAST position — a stand-in failed live: choosing the newest heap rows,
+which needs no access to `pg_toast`, moved 1.07 GB out of segment 0 per run and truncated 770 kB, so
+each gc run grew the disk by about 1.1 GB, because new chunks reuse low heap slots while their TOAST
+values append at the relation's end. Reading the TOAST relation needs `USAGE` on schema `pg_toast`,
+which a table's owner is not granted, so the service role needs
+`grant usage on schema pg_toast to <role>` in its own database (the platform's deployer makes it).
+The grant is narrow: `USAGE` only lets the role name the TOAST relations, each of which keeps its
+table's ACL, so the role reads only its own tables' TOAST. Without it compaction leaves every
+oversized segment untouched — moves nothing, vacuums nothing — and logs at INFO, once per run, the
+grant to make.
 
 A consumer whose tables predate this copies
 `blobstore/src/main/resources/db/blobstore-segments-upgrade.sql` verbatim into a migration of its

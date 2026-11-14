@@ -115,15 +115,18 @@ public class BlobCompaction {
    *       over the partition's on-disk size.
    *   <li>A segment larger than twice {@code qits.artifacts.blobs.segment-size} is never drained
    *       whole, whatever its live share: it is <b>shrunk from its tail</b> instead, by at most
-   *       {@code qits.artifacts.blobs.compaction.shrink-budget} (default 1 GiB) of moved chunks per
-   *       run. Its newest owned chunks by heap order, a budget's worth, move into the open segment,
-   *       and a VACUUM of the partition cuts the emptied pages off its end. Found live on
+   *       {@code qits.artifacts.blobs.compaction.shrink-budget} (default 1 GiB) per run. The owned
+   *       chunks whose bytes sit in the last budget's worth of its TOAST relation move into the open
+   *       segment, and a VACUUM of the partition cuts the emptied pages off its end. Found live on
    *       the first day of segments: the upgrade attaches the whole old table as segment 0 — 20 GB
    *       and 92% live on dev — which the ratio rule would leave alone until it fell under half live,
    *       giving back nothing for every blob deleted from it meanwhile (and no longer even reusing
    *       that space, since new chunks go only to the open segment), and then need half of it free
    *       at once to drain. Once a segment is down to twice the segment size the ratio rule below
-   *       takes it over.
+   *       takes it over. The shrink reads the TOAST relation, so it needs USAGE on schema {@code
+   *       pg_toast}, which a table's owner is not granted: a role without it leaves every oversized
+   *       segment untouched and logs, once per run at INFO, the grant to make. The platform's
+   *       deployer grants it to each service role in its own database.
    *   <li>A segment below {@code qits.artifacts.blobs.compaction.live-ratio} (default 0.5) is
    *       drained: each promoted blob's chunks are moved into the open segment, under that blob's
    *       advisory lock, a batch per short transaction. STAGING content is never moved.

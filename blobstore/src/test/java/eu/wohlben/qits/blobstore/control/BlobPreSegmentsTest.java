@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import eu.wohlben.qits.blobstore.control.BlobCompaction.CompactionResult;
 import eu.wohlben.qits.blobstore.testdb.BlobTables;
+import eu.wohlben.qits.blobstore.testdb.EmbeddedPg;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import java.io.InputStream;
@@ -101,7 +102,13 @@ class BlobPreSegmentsTest extends SegmentTestSupport {
     assertServedIntact(after);
 
     // A gc sweep reclaims three quarters of what was stored before the upgrade. Segment 0 is
-    // closed and a quarter live, so the next run drains it and drops the old table outright.
+    // closed, a quarter live and past twice the segment size, so the next run shrinks it from its
+    // tail down to nothing and drops the old table outright. The shrink reads pg_toast, which the
+    // owner may only with the grant the platform's deployer makes to each service role.
+    try (Connection admin = EmbeddedPg.connectAsSuperuser(BlobTables.preSegmentsUrl());
+        Statement sql = admin.createStatement()) {
+      sql.execute("grant usage on schema pg_toast to " + EmbeddedPg.USER);
+    }
     List<String> kept = new ArrayList<>();
     for (int i = 0; i < stored.size(); i++) {
       if (i % 4 == 0) {
