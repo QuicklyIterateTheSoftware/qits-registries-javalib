@@ -2,7 +2,6 @@ package eu.wohlben.qits.blobstore.testdb;
 
 import io.zonky.test.db.postgres.embedded.EmbeddedPostgres;
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.Statement;
 
@@ -74,12 +73,25 @@ public final class EmbeddedPg {
     return url;
   }
 
+  /**
+   * A connection to the embedded instance, through the driver class rather than {@code
+   * DriverManager}. A test profile's config overrides are read during test discovery, in a
+   * classloader whose {@code DriverManager} has no postgres driver registered ("No suitable
+   * driver") — naming the driver directly works from every classloader that can see the class.
+   */
+  public static Connection connect(String url) throws java.sql.SQLException {
+    java.util.Properties credentials = new java.util.Properties();
+    credentials.setProperty("user", USER);
+    credentials.setProperty("password", PASSWORD);
+    return new org.postgresql.Driver().connect(url, credentials);
+  }
+
   private static String adminUrl() {
     return "jdbc:postgresql://localhost:" + port() + "/postgres";
   }
 
   private static void ensureDatabase(String database) {
-    try (Connection admin = DriverManager.getConnection(adminUrl(), USER, PASSWORD);
+    try (Connection admin = connect(adminUrl());
         Statement sql = admin.createStatement()) {
       try (ResultSet found =
           sql.executeQuery("select 1 from pg_database where datname = '" + database + "'")) {
