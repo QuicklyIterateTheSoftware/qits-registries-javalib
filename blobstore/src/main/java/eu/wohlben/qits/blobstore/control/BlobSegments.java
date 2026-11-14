@@ -43,9 +43,10 @@ import org.jboss.logging.Logger;
  * <ul>
  *   <li><b>A chunk insert names its segment in the statement that writes it</b> — {@code
  *       (select segment from blob_segment)} in the {@code VALUES} — so there is no window between
- *       choosing a segment and writing into it beyond one statement's own snapshot. A roll holds
- *       {@code blob_segment} exclusively while it attaches the next partition, so a statement that
- *       reads the new number always routes against a partition list that contains it.
+ *       choosing a segment and writing into it beyond one statement's own snapshot. A writer that
+ *       names none gets the same answer from the column default, {@code blob_open_segment()}. A
+ *       roll blocks every writer on the parent while it attaches the next partition, so a statement
+ *       that reads the new number always routes against a partition list that contains it.
  *   <li><b>A compaction run never drains the segment that was open when it started</b>, nor any
  *       later one. A writer whose statement read the old open number before a roll committed is
  *       therefore always writing into a segment this run leaves alone.
@@ -179,7 +180,7 @@ class BlobSegments {
    * the old schema keeps omitting the segment after a consumer migrates, and the first such insert
    * fails — no partition takes a NULL segment — which is the cue to look again and write it the new
    * way. The opposite case, a segmented insert that finds no partition for the segment it read,
-   * cannot happen while a roll holds {@code blob_segment} exclusively (see {@link #roll}) and a drop
+   * cannot happen while a roll blocks writers on the parent (see {@link #roll(int)}) and a drop
    * holds the parent lock (see {@link #compact}), and is retried all the same because a failed
    * insert wrote nothing and a second one, in a fresh statement, sees the partitions afresh.
    */
@@ -293,21 +294,37 @@ class BlobSegments {
    *
    * <p><b>Create-then-attach, not {@code CREATE TABLE ... PARTITION OF}.</b> The latter takes an
    * ACCESS EXCLUSIVE lock on the parent, which would stall every blob read for the moment it runs;
-   * ATTACH takes only SHARE UPDATE EXCLUSIVE there, which reads and writes pass straight through.
-   * {@code LIKE ... INCLUDING ALL} copies the columns, the external storage of {@code bytes} and
-   * the primary key, so ATTACH adopts that key as the partition's half of the parent's and clones
-   * the foreign key onto an empty table — nothing to validate.
+   * ATTACH takes only SHARE UPDATE EXCLUSIVE there, which reads pass straight through. {@code LIKE
+   * ... INCLUDING ALL} copies the columns, the {@code blob_open_segment()} default, the external
+   * storage of {@code bytes} and the primary key, so ATTACH adopts that key as the partition's half
+   * of the parent's and clones the foreign key onto an empty table — nothing to validate.
    *
-   * <p><b>But the weak lock opens a race, and {@code blob_segment} closes it.</b> Because ATTACH
-   * does not conflict with a writer's lock on the parent, a chunk insert can take that lock — and
-   * with it the parent's partition list — before the roll commits, then take its snapshot after,
-   * read the NEW open segment, and find no partition for it in the list it holds ("no partition of
-   * relation found for row"). Measured: nine such inserts in forty runs of the concurrency suite.
-   * So the roll first takes ACCESS EXCLUSIVE on {@code blob_segment} itself and holds it to the
-   * commit. Every statement that names the open segment reads that table, so it queues there; and
-   * a lock granted after waiting processes the invalidations the roll's commit sent, so the parent's
-   * partition list it then routes against already includes the new partition. Chunk inserts pause
-   * for the few milliseconds a roll takes; chunk reads never touch {@code blob_segment} and do not.
+   * <p><b>But the weak lock opens a race, and the roll closes it by pausing writers.</b> Because
+   * ATTACH does not conflict with a writer's lock on the parent, a chunk insert can take that lock —
+   * and with it the parent's partition list — before the roll commits, then read the NEW open
+   * segment after, and find no partition for it in the list it holds ("no partition of relation
+   * found for row"). Measured: nine such inserts in forty runs of the concurrency suite. Locking
+   * {@code blob_segment} closes it for a statement that reads that table while it is planned, but
+   * only incidentally for a writer that leaves the segment to the column default — a library older
+   * than qits-2248, mid-rollout — which evaluates {@code blob_open_segment()} during execution:
+   * whether its partition list is loaded before or after that is an executor detail (PostgreSQL 18
+   * loads it after, measured; nothing promises it). So the roll takes, before the attach and held
+   * to the commit:
+   *
+   * <ol>
+   *   <li>SHARE ROW EXCLUSIVE on {@code blob_content} — what the attach's foreign-key clone needs
+   *       anyway, taken first so that a delete holding {@code blob_content} and cascading into the
+   *       parent can never wait on the roll while the roll waits on it;
+   *   <li>SHARE ROW EXCLUSIVE on the parent ({@code ONLY}, not the partitions). It conflicts with
+   *       every writer's ROW EXCLUSIVE and with no reader's ACCESS SHARE: chunk inserts, drains and
+   *       cascading deletes queue behind the roll, chunk reads do not notice it. A writer granted the
+   *       lock after waiting processes the invalidations the roll's commit sent, so the partition list
+   *       it routes against already holds the new partition, and its snapshot already sees the new
+   *       open segment;
+   *   <li>ACCESS EXCLUSIVE on {@code blob_segment}, so nothing reads the open number mid-roll.
+   * </ol>
+   *
+   * Writers pause for the few milliseconds a roll takes, once per segment-size of writes; reads never.
    *
    * <p>Under a store-wide advisory lock, and only if {@code blob_segment} still says {@code from}:
    * every replica's promotes see the same full segment, and exactly one of them rolls.
@@ -315,6 +332,15 @@ class BlobSegments {
    * @return whether this call rolled; false if another process got there first
    */
   boolean roll(int from) {
+    return roll(from, () -> {});
+  }
+
+  /**
+   * {@link #roll(int)}, running {@code beforeCommit} while every lock is held and the new partition
+   * is attached but not yet committed. Here for the suite: it is how a test puts a writer in the
+   * queue behind a real roll instead of hoping one lands there.
+   */
+  boolean roll(int from, Runnable beforeCommit) {
     int next = from + 1;
     String partition = PARTITION_PREFIX + next;
     boolean rolled =
@@ -324,8 +350,10 @@ class BlobSegments {
               try (Statement sql = connection.createStatement()) {
                 sql.execute("set local lock_timeout = '" + LOCK_TIMEOUT + "'");
                 lockNamed(connection, ROLL_LOCK);
-                // Before the attach, and held to the commit: see the method comment for why every
-                // reader of the open segment must queue behind the whole roll.
+                // Before the attach, held to the commit, in this order: see the method comment for
+                // why every writer must queue behind the whole roll, and why readers need not.
+                sql.execute("lock table blob_content in share row exclusive mode");
+                sql.execute("lock table only blob_chunk in share row exclusive mode");
                 sql.execute("lock table blob_segment in access exclusive mode");
                 try (ResultSet row = sql.executeQuery("select segment from blob_segment")) {
                   if (!row.next() || row.getInt(1) != from) {
@@ -340,6 +368,7 @@ class BlobSegments {
                         + next
                         + ")");
                 sql.execute("update blob_segment set segment = " + next);
+                beforeCommit.run();
                 return true;
               }
             });

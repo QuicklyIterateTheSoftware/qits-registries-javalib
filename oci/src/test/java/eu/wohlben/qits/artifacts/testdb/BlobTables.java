@@ -47,6 +47,7 @@ public final class BlobTables {
     try (Connection connection = DriverManager.getConnection(url, EmbeddedPg.USER, EmbeddedPg.PASSWORD);
         Statement sql = connection.createStatement()) {
       sql.execute("drop table if exists blob, blob_chunk, blob_content, blob_segment cascade");
+      sql.execute("drop function if exists blob_open_segment()");
       for (String statement : statements()) {
         sql.execute(statement);
       }

@@ -98,10 +98,12 @@ closed segments and drops their partitions, which is what returns the disk.
 
 A consumer whose tables predate this copies
 `blobstore/src/main/resources/db/blobstore-segments-upgrade.sql` verbatim into a migration of its
-own. It rewrites no chunk: the existing table becomes partition 0, attached as it is. **Bump the
-library first, migrate second** — the library detects the old schema and behaves exactly as before
-on it (compaction answers `UNSEGMENTED`), while a library older than qits-2248 cannot write to an
-upgraded schema at all.
+own. It rewrites no chunk: the existing table becomes partition 0, attached as it is. **The bump and
+the migration may ship in either order, or together.** The library detects the old schema and
+behaves exactly as before on it (compaction answers `UNSEGMENTED`); and a library older than
+qits-2248 keeps writing to an upgraded schema — which a start-first deploy needs, since the previous
+instance serves uploads after the new one's Flyway has run — because `blob_chunk.segment` defaults to
+`blob_open_segment()`, the open segment. Only the new library rolls and compacts.
 
 ## Building
 

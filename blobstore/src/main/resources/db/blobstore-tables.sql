@@ -21,6 +21,26 @@ create table blob_content (
     started_at  timestamptz not null
 );
 
+-- The open segment: the one partition every new chunk is written into. Exactly one row, which the
+-- `singleton` key and its check make structural rather than a convention. The store's roll moves it
+-- forward, in the transaction that attaches the next partition.
+create table blob_segment (
+    singleton  boolean primary key default true check (singleton),
+    segment    integer not null
+);
+
+-- What blob_chunk.segment defaults to: the open segment, read when the row is inserted. VOLATILE, so
+-- it is evaluated per row and never folded into a plan.
+--
+-- The default exists for writers that do not name a segment, and the one that matters is a library
+-- older than qits-2248: consumers deploy start-first, so the previous instance keeps serving uploads
+-- for a minute or more after the new instance's Flyway has migrated, inserting
+-- `(content_id, seq, bytes)` as it always did. With this default those rows land in the open segment
+-- like any other. The current library names the segment explicitly and gets the same answer.
+create function blob_open_segment() returns integer language sql volatile as $$
+    select segment from blob_segment
+$$;
+
 -- One row per 1 MiB slice, list-partitioned by SEGMENT so that disk can be given back.
 --
 -- Why partitions at all: PostgreSQL never returns the space a delete frees to the filesystem — it
@@ -45,26 +65,17 @@ create table blob_chunk (
     content_id  uuid not null,
     seq         integer not null,
     bytes       bytea not null,
-    segment     integer not null,
+    segment     integer not null default blob_open_segment(),
     constraint blob_chunk_pkey primary key (content_id, seq, segment),
     constraint blob_chunk_content_id_fkey foreign key (content_id)
         references blob_content (content_id) on delete cascade
 ) partition by list (segment);
 alter table blob_chunk alter column bytes set storage external;
 
--- The open segment: the one partition every new chunk is written into. Exactly one row, which the
--- `singleton` key and its check make structural rather than a convention. A chunk insert reads it in
--- the same statement that writes the chunk; the store's roll moves it forward, in the transaction
--- that attaches the next partition.
---
 -- Partitions are named blob_chunk_<segment> and the store relies on that name when it rolls.
 -- Segment 0 is reserved for the chunks an upgraded database held before segmentation (see
 -- db/blobstore-segments-upgrade.sql), so a fresh install opens at 1 — the two shapes then differ
 -- only in whether a legacy segment 0 exists, and the store never needs to know which it is on.
-create table blob_segment (
-    singleton  boolean primary key default true check (singleton),
-    segment    integer not null
-);
 create table blob_chunk_1 partition of blob_chunk for values in (1);
 insert into blob_segment (segment) values (1);
 

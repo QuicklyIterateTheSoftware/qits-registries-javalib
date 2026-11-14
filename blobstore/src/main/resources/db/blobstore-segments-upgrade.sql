@@ -6,11 +6,12 @@
 -- db/blobstore-tables.sql instead, and both end in the same shape — except that an upgraded
 -- database carries one extra partition, blob_chunk_0, holding every chunk it stored before.
 --
--- RELEASE ORDER: bump the library first, migrate second. A library from qits-2248 on detects
--- whether blob_segment exists and, while it does not, writes and reads exactly as before — so the
--- bump can ship ahead of this migration. A library OLDER than that writing to an upgraded database
--- fails every chunk insert (it names no segment, and the column has no default on purpose: a
--- default would silently pin those writes to one segment forever), so never run this under one.
+-- RELEASE ORDER: either. A library from qits-2248 on detects whether blob_segment exists and, while
+-- it does not, writes and reads exactly as before — so the bump can ship ahead of this migration. A
+-- library OLDER than that keeps working on an upgraded database too, which a start-first deploy
+-- depends on (the previous instance serves uploads for a while after the new one's Flyway ran): it
+-- inserts chunks without a segment, and the column's default, blob_open_segment(), puts them in the
+-- open segment. What an old library cannot do is roll or compact — only the new one does either.
 --
 -- WHAT IT COSTS. Nothing here rewrites a chunk. Blob bytes live in blob_chunk's TOAST relation; the
 -- heap holds one small row per MiB (key plus TOAST pointer), and that heap is all any statement
@@ -46,12 +47,34 @@ create unique index blob_chunk_0_pkey on blob_chunk_0 (content_id, seq, segment)
 alter table blob_chunk_0 drop constraint blob_chunk_pkey;
 alter table blob_chunk_0 add constraint blob_chunk_0_pkey primary key using index blob_chunk_0_pkey;
 
+-- First the open segment and its default, as in db/blobstore-tables.sql: the parent below names the
+-- function, so both must exist before it. The open segment is the one partition every new chunk is
+-- written into. Exactly one row, which the `singleton` key and its check make structural rather than
+-- a convention. The store's roll moves it forward, in the transaction that attaches the next
+-- partition.
+create table blob_segment (
+    singleton  boolean primary key default true check (singleton),
+    segment    integer not null
+);
+
+-- What blob_chunk.segment defaults to: the open segment, read when the row is inserted. VOLATILE, so
+-- it is evaluated per row and never folded into a plan.
+--
+-- The default exists for writers that do not name a segment, and the one that matters is a library
+-- older than qits-2248: consumers deploy start-first, so the previous instance keeps serving uploads
+-- for a minute or more after the new instance's Flyway has migrated, inserting
+-- `(content_id, seq, bytes)` as it always did. With this default those rows land in the open segment
+-- like any other. The current library names the segment explicitly and gets the same answer.
+create function blob_open_segment() returns integer language sql volatile as $$
+    select segment from blob_segment
+$$;
+
 -- The parent, statement for statement as in db/blobstore-tables.sql — see the reasoning there.
 create table blob_chunk (
     content_id  uuid not null,
     seq         integer not null,
     bytes       bytea not null,
-    segment     integer not null,
+    segment     integer not null default blob_open_segment(),
     constraint blob_chunk_pkey primary key (content_id, seq, segment),
     constraint blob_chunk_content_id_fkey foreign key (content_id)
         references blob_content (content_id) on delete cascade
@@ -65,10 +88,7 @@ alter table blob_chunk alter column bytes set storage external;
 alter table blob_chunk attach partition blob_chunk_0 for values in (0);
 
 -- And the first open segment, exactly as a fresh install opens it. Segment 0 is closed from here:
--- nothing writes there again, and compaction drains and drops it once its live share falls.
-create table blob_segment (
-    singleton  boolean primary key default true check (singleton),
-    segment    integer not null
-);
+-- nothing writes there again — an old library's inserts included, since the parent's default sends
+-- them to the open segment — and compaction drains and drops it once its live share falls.
 create table blob_chunk_1 partition of blob_chunk for values in (1);
 insert into blob_segment (segment) values (1);
