@@ -58,8 +58,13 @@ public class BlobCompaction {
    * @param segmentsHeld segments that were drained or empty but could not be dropped this run:
    *     STAGING chunks of an upload still in them, or the parent lock not granted within its
    *     timeout. Not a failure; the next run tries again
-   * @param bytesMoved chunk bytes copied into the open segment while draining — the price paid in
-   *     writes (and WAL) for the disk returned
+   * @param bytesMoved chunk bytes copied into the open segment while draining or shrinking — the
+   *     price paid in writes (and WAL) for the disk returned
+   * @param segmentsShrunk oversized closed segments — past twice {@code
+   *     qits.artifacts.blobs.segment-size}, in practice segment 0 — that this run cut down from their
+   *     tail and that lost disk doing so
+   * @param bytesTruncated on-disk bytes those segments lost: the empty pages VACUUM cut off their
+   *     end, after the live chunks in their tail moved out
    */
   public record CompactionResult(
       State state,
@@ -70,11 +75,15 @@ public class BlobCompaction {
       int segmentsDrained,
       int segmentsDropped,
       int segmentsHeld,
-      long bytesMoved) {
+      long bytesMoved,
+      int segmentsShrunk,
+      long bytesTruncated) {
 
     /** Why a run did what it did. Every value is a normal answer, not an error. */
     public enum State {
-      /** The run looked at every closed segment, and drained and dropped what qualified. */
+      /**
+       * The run looked at every closed segment, and drained, shrank and dropped what qualified.
+       */
       COMPACTED,
       /**
        * The blob tables are the pre-segment shape: the consumer has not run {@code
@@ -104,6 +113,17 @@ public class BlobCompaction {
    *   <li>Takes every <em>closed</em> segment — every one older than the segment open when the run
    *       started — oldest first, and computes its live share: the stored size of its chunk values
    *       over the partition's on-disk size.
+   *   <li>A segment larger than twice {@code qits.artifacts.blobs.segment-size} is never drained
+   *       whole, whatever its live share: it is <b>shrunk from its tail</b> instead, by at most
+   *       {@code qits.artifacts.blobs.compaction.shrink-budget} (default 1 GiB) per run. The owned
+   *       chunks whose bytes sit in the last budget's worth of its TOAST relation move into the open
+   *       segment, and a VACUUM of the partition cuts the emptied pages off its end. Found live on
+   *       the first day of segments: the upgrade attaches the whole old table as segment 0 — 20 GB
+   *       and 92% live on dev — which the ratio rule would leave alone until it fell under half live,
+   *       giving back nothing for every blob deleted from it meanwhile (and no longer even reusing
+   *       that space, since new chunks go only to the open segment), and then need half of it free
+   *       at once to drain. Once a segment is down to twice the segment size the ratio rule below
+   *       takes it over.
    *   <li>A segment below {@code qits.artifacts.blobs.compaction.live-ratio} (default 0.5) is
    *       drained: each promoted blob's chunks are moved into the open segment, under that blob's
    *       advisory lock, a batch per short transaction. STAGING content is never moved.
@@ -115,7 +135,9 @@ public class BlobCompaction {
    * <p>Readers never miss a chunk and never see one twice; uploads and promotes carry on throughout.
    * The only waits anyone sees are one blob's advisory lock while its batch moves, and the parent
    * lock for the instant each drop takes (bounded: a drop that cannot get it in two seconds is left
-   * for the next run).
+   * for the next run). A shrink's truncation only ever tries for its lock and never queues, so it
+   * stalls no read; a truncation that cannot get it, or that a long-running transaction elsewhere
+   * keeps from pruning the moved chunks' old copies, gives the pages back on a later run.
    *
    * @throws IllegalStateException if called inside a caller's transaction
    */

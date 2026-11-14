@@ -96,6 +96,22 @@ partition once the open one passes `qits.artifacts.blobs.segment-size` (1 GiB), 
 — called by a consumer's gc sweep after its deletions — moves the live chunks out of mostly-dead
 closed segments and drops their partitions, which is what returns the disk.
 
+A closed segment past twice the segment size is never drained whole. That is, in practice, segment 0
+— the whole pre-upgrade table, which the upgrade below attaches as it is — and the ratio rule alone
+failed on it live: on dev it was 20 GB and 92% live, so compaction left it alone, every blob the gc
+deleted from it gave back nothing, and since new chunks go only into the open segment the space those
+deletes freed was not even reused any more, as it had been before the upgrade. Waiting for it to fall
+under half live would also have needed half of it free at once for the drain. So each run shrinks it
+from the tail instead, by at most `qits.artifacts.blobs.compaction.shrink-budget` (1 GiB): the owned
+chunks whose bytes sit in the last budget's worth of its TOAST relation (found with a TID range scan,
+mapped through `pg_column_toast_chunk_id`, PostgreSQL 17+) move into the open segment, and a
+`VACUUM (TRUNCATE true, SKIP_LOCKED true)` of the partition cuts the emptied pages off its end. The disk comes back a
+budget per gc run, at the price of moving about that much; once the segment is down to twice the
+segment size the ratio rule takes it over. A STAGING upload in the tail, a long-running transaction
+elsewhere (whose snapshot keeps the moved chunks' old copies alive) or a truncation lock VACUUM could
+not get only delays the return to a later run. `CompactionResult` reports it as `segmentsShrunk` and
+`bytesTruncated`.
+
 A consumer whose tables predate this copies
 `blobstore/src/main/resources/db/blobstore-segments-upgrade.sql` verbatim into a migration of its
 own. It rewrites no chunk: the existing table becomes partition 0, attached as it is. **The bump and

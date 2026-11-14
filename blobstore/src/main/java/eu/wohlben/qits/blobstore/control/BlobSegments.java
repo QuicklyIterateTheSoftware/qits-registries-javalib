@@ -10,7 +10,9 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -36,7 +38,9 @@ import org.jboss.logging.Logger;
  * through {@link BlobCompaction} — finds the closed segments that are mostly dead, moves their few
  * live chunks into the open segment one blob at a time, and drops the emptied partition, which
  * unlinks its files. The disk returned is a whole segment minus its live share, and no statement
- * ever touches more than one blob's chunks or holds a lock wider than a moment.
+ * ever touches more than one blob's chunks or holds a lock wider than a moment. A closed segment
+ * past twice the segment size — segment 0, the whole table the upgrade attached — is instead shrunk
+ * from its tail a bounded step per run, see {@link #shrinkTail}.
  *
  * <p><b>The invariants that make it safe</b>, each restated where it is enforced:
  *
@@ -142,6 +146,19 @@ class BlobSegments {
    */
   @ConfigProperty(name = "qits.artifacts.blobs.compaction.live-ratio", defaultValue = "0.5")
   double liveRatio;
+
+  /**
+   * How far one compaction run shrinks oversized closed segments from their tail, in bytes of the
+   * TOAST relation where chunk bytes live. An oversized segment is one past twice {@code
+   * segment-size} — in practice segment 0, the whole pre-qits-2248 table the upgrade attached.
+   *
+   * <p>The budget bounds what one run costs: at most this many bytes read in the tail, roughly this
+   * many moved into the open segment (one chunk past it, for a value straddling the tail's edge) and
+   * so roughly this much free disk needed at once, before the truncation gives it back. See {@link
+   * #shrinkTail}.
+   */
+  @ConfigProperty(name = "qits.artifacts.blobs.compaction.shrink-budget", defaultValue = "1073741824")
+  long shrinkBudget;
 
   /** Null until first asked; then whether {@code blob_segment} exists. See the class comment. */
   private volatile Boolean segmented;
@@ -393,7 +410,7 @@ class BlobSegments {
       LOG.info("Blob compaction: the blob tables are not segmented yet; nothing to do");
       return new CompactionResult(
           CompactionResult.State.UNSEGMENTED,
-          before.tables(), before.tables(), before.database(), before.database(), 0, 0, 0, 0);
+          before.tables(), before.tables(), before.database(), before.database(), 0, 0, 0, 0, 0, 0);
     }
     // One run at a time across every replica, on a session lock held by a connection of its own
     // for the length of the run. Two runs would not corrupt anything — every move is per blob under
@@ -405,7 +422,11 @@ class BlobSegments {
             LOG.info("Blob compaction: another run holds the compaction lock; skipping this one");
             return new CompactionResult(
                 CompactionResult.State.ALREADY_RUNNING,
-                before.tables(), before.tables(), before.database(), before.database(), 0, 0, 0, 0);
+                before.tables(),
+                before.tables(),
+                before.database(),
+                before.database(),
+                0, 0, 0, 0, 0, 0);
           }
           try {
             return compactLocked(before);
@@ -422,10 +443,30 @@ class BlobSegments {
     int drained = 0;
     int dropped = 0;
     int held = 0;
+    int shrunk = 0;
     long moved = 0;
+    long truncated = 0;
+    long shrinkLeft = shrinkBudget;
     for (Partition closed : closedPartitions(openAtStart)) {
       Live live = liveShare(closed.segment());
       boolean empty = live.rows() == 0;
+      if (!empty && closed.diskBytes() > 2 * segmentSize) {
+        // Oversized: never drained whole, whatever its live share — see shrinkTail.
+        if (shrinkLeft <= 0) {
+          continue;
+        }
+        Shrink shrink = shrinkTail(closed, shrinkLeft);
+        shrinkLeft -= shrink.windowBytes();
+        moved += shrink.moved();
+        truncated += shrink.truncated();
+        if (shrink.truncated() > 0) {
+          shrunk++;
+        }
+        if (liveShare(closed.segment()).rows() > 0) {
+          continue;
+        }
+        empty = true;
+      }
       double share = closed.diskBytes() == 0 ? 0 : (double) live.bytes() / closed.diskBytes();
       if (!empty && share >= liveRatio) {
         continue;
@@ -456,11 +497,16 @@ class BlobSegments {
             drained,
             dropped,
             held,
-            moved);
+            moved,
+            shrunk,
+            truncated);
     LOG.infof(
-        "Blob compaction: drained %d segments (%d bytes moved), dropped %d, held %d; blob tables"
-            + " %d -> %d bytes on disk, database %d -> %d bytes",
+        "Blob compaction: drained %d segments, shrunk %d oversized ones by %d bytes (%d bytes moved"
+            + " in all), dropped %d, held %d; blob tables %d -> %d bytes on disk, database %d -> %d"
+            + " bytes",
         drained,
+        shrunk,
+        truncated,
         moved,
         dropped,
         held,
@@ -469,6 +515,215 @@ class BlobSegments {
         before.database(),
         after.database());
     return result;
+  }
+
+  /**
+   * What one tail shrink did: the tail it looked at, the bytes it moved out of it, and the on-disk
+   * bytes the segment lost.
+   */
+  private record Shrink(long windowBytes, long moved, long truncated) {}
+
+  /** A partition's TOAST relation (a regclass-quoted name), its size in pages, the block size. */
+  record Toast(String name, long pages, long blockSize) {}
+
+  /**
+   * Shrinks an oversized closed segment from the tail of its TOAST relation by at most {@code
+   * budget} bytes.
+   *
+   * <p><b>Why an oversized segment is not drained like the others.</b> Found live on qits-2248's
+   * first day: the upgrade attached the whole pre-existing table as segment 0, 20 GB on disk and 92%
+   * live. The ratio rule leaves such a segment alone, so every blob the gc deleted from it returned
+   * nothing — and, worse than before the upgrade, the space it freed was no longer reused either,
+   * since new chunks go only into the open segment. Disk grew by everything deleted from it, and the
+   * full drain that would eventually follow needs half the segment as free disk at once. A segment
+   * that large must instead give disk back in bounded steps, whatever its live share.
+   *
+   * <p><b>The one way PostgreSQL gives part of a table back is a VACUUM truncating empty pages off
+   * its end.</b> So the shrink empties the end:
+   *
+   * <ol>
+   *   <li>The tail is the last {@code budget} bytes of the partition's TOAST relation, from block
+   *       {@code N = max(0, pages - budget / block_size)} on.
+   *   <li>The live TOAST values there are read with a TID range scan ({@code ctid >= '(N,0)'}), which
+   *       reads those pages only, and mapped to their chunks through {@code
+   *       pg_column_toast_chunk_id} on the partition's heap — one small row per chunk, cheap to scan.
+   *       Only chunks some blob owns qualify: STAGING content is never moved.
+   *   <li>Exactly those chunks — not the rest of their blob, which stays put until the tail reaches
+   *       it — move into the open segment by the drain's own per-blob move, under the blob's lock.
+   *   <li>A plain {@code VACUUM (TRUNCATE true, SKIP_LOCKED true)} on the partition prunes the moved
+   *       and deleted tuples and cuts the now-empty pages off the end of the TOAST relation (and
+   *       the heap), which returns them to the filesystem.
+   * </ol>
+   *
+   * <p><b>What can make a run return less.</b> The truncation stops at the last live tuple, so a
+   * STAGING upload in the tail holds the tail until it is promoted (the next run moves it) or
+   * reaped. VACUUM can only remove tuples no snapshot can still see, so a long transaction elsewhere
+   * keeps the moved chunks' old copies until it ends. And the truncation needs a moment's ACCESS
+   * EXCLUSIVE lock on the partition, which VACUUM only ever tries for — it never queues, so no read
+   * waits on it, and if it cannot get it the pages stay until the next run. In every case the moved
+   * chunks are correctly in the open segment; only the return is late. One floor is PostgreSQL's
+   * own: VACUUM truncates only when at least 1000 pages (8 MB) or a sixteenth of the relation can
+   * go, so a budget under 8 MiB on a large segment would move chunks and truncate nothing.
+   *
+   * <p><b>Cost.</b> Up to {@code budget} bytes moved (plus one chunk at the edge), and a VACUUM of
+   * the partition — which skips the pages its visibility map knows clean, but scans the TOAST
+   * relation's index whole when there is anything to remove from it.
+   */
+  private Shrink shrinkTail(Partition partition, long budget) {
+    Toast toast = toastOf(partition.name());
+    if (toast == null || toast.pages() == 0) {
+      return new Shrink(0, 0, 0);
+    }
+    long startBlock = Math.max(0, toast.pages() - budget / toast.blockSize());
+    long windowBytes = (toast.pages() - startBlock) * toast.blockSize();
+    Map<Owned, List<Integer>> tail = tailChunks(partition.name(), toast.name(), startBlock);
+    long moved = 0;
+    for (Map.Entry<Owned, List<Integer>> blob : tail.entrySet()) {
+      List<Integer> seqs = blob.getValue();
+      for (int from = 0; from < seqs.size(); from += DRAIN_BATCH) {
+        long batch =
+            moveSeqs(
+                blob.getKey(),
+                partition.segment(),
+                seqs.subList(from, Math.min(seqs.size(), from + DRAIN_BATCH)));
+        if (batch < 0) {
+          break;
+        }
+        moved += batch;
+      }
+    }
+    if (moved > 0) {
+      rollIfFull();
+    }
+    long beforeVacuum = totalSize(partition.name());
+    vacuum(partition.name());
+    long truncated = Math.max(0, beforeVacuum - totalSize(partition.name()));
+    LOG.debugf(
+        "Blob segment %d: tail from TOAST block %d of %d, %d chunks of %d blobs moved (%d bytes),"
+            + " %d bytes truncated",
+        partition.segment(),
+        startBlock,
+        toast.pages(),
+        tail.values().stream().mapToInt(List::size).sum(),
+        tail.size(),
+        moved,
+        truncated);
+    return new Shrink(windowBytes, moved, truncated);
+  }
+
+  /** The partition's TOAST relation and its size, or null if it has none. */
+  Toast toastOf(String partition) {
+    return db.autocommit(
+        "Failed to find the TOAST relation of " + partition,
+        connection -> {
+          try (PreparedStatement select =
+              connection.prepareStatement(
+                  "select t.oid::regclass::text,"
+                      + " pg_relation_size(t.oid) / current_setting('block_size')::bigint,"
+                      + " current_setting('block_size')::bigint"
+                      + " from pg_class c join pg_class t on t.oid = c.reltoastrelid"
+                      + " where c.oid = to_regclass(?)")) {
+            select.setString(1, partition);
+            try (ResultSet row = select.executeQuery()) {
+              return row.next() ? new Toast(row.getString(1), row.getLong(2), row.getLong(3)) : null;
+            }
+          }
+        });
+  }
+
+  /**
+   * The statement that lists the TOAST values with a tuple at or past {@code startBlock}: a TID
+   * range scan, which reads the tail pages and no others. A statement of its own, on purpose — folded
+   * into the chunk lookup as a subquery, the planner is free to probe the TOAST index once per heap
+   * row instead, which on segment 0 reads the whole relation the shrink exists to avoid. The name
+   * is regclass output, already quoted; the block is a number.
+   */
+  static String tailValuesSql(String toast, long startBlock) {
+    return "select distinct chunk_id::bigint from "
+        + toast
+        + " where ctid >= '("
+        + startBlock
+        + ",0)'::tid";
+  }
+
+  /**
+   * The owned chunks of a partition whose bytes live in its TOAST relation's tail, by blob. The
+   * value ids come from {@link #tailValuesSql}; mapping them back scans the partition's heap — one
+   * small row per chunk, with {@code pg_column_toast_chunk_id} reading only the TOAST pointer.
+   */
+  private Map<Owned, List<Integer>> tailChunks(String partition, String toast, long startBlock) {
+    return db.autocommit(
+        "Failed to read the tail of " + partition,
+        connection -> {
+          List<Long> values = new ArrayList<>();
+          try (Statement select = connection.createStatement();
+              ResultSet rows = select.executeQuery(tailValuesSql(toast, startBlock))) {
+            while (rows.next()) {
+              values.add(rows.getLong(1));
+            }
+          }
+          Map<Owned, List<Integer>> found = new LinkedHashMap<>();
+          if (values.isEmpty()) {
+            return found;
+          }
+          try (PreparedStatement select =
+              connection.prepareStatement(
+                  "select p.content_id, b.id, p.seq from "
+                      + partition
+                      + " p join blob b on b.content_id = p.content_id"
+                      + " where pg_column_toast_chunk_id(p.bytes)::bigint = any(?)"
+                      + " order by p.content_id, p.seq")) {
+            select.setArray(1, connection.createArrayOf("int8", values.toArray()));
+            try (ResultSet rows = select.executeQuery()) {
+              while (rows.next()) {
+                Owned owned = new Owned(rows.getObject(1, UUID.class), rows.getString(2));
+                found.computeIfAbsent(owned, key -> new ArrayList<>()).add(rows.getInt(3));
+              }
+            }
+          }
+          return found;
+        });
+  }
+
+  private long totalSize(String partition) {
+    return db.autocommit(
+        "Failed to measure " + partition,
+        connection -> {
+          try (PreparedStatement select =
+              connection.prepareStatement(
+                  "select coalesce(pg_total_relation_size(to_regclass(?)), 0)")) {
+            select.setString(1, partition);
+            try (ResultSet row = select.executeQuery()) {
+              row.next();
+              return row.getLong(1);
+            }
+          }
+        });
+  }
+
+  /**
+   * A plain VACUUM of one partition, with truncation asked for explicitly so a {@code
+   * vacuum_truncate = off} reloption cannot quietly turn the shrink into a no-op. Never inside a
+   * transaction — VACUUM refuses one — which the autocommit connection guarantees.
+   *
+   * <p>{@code SKIP_LOCKED}: if anything holds a lock that conflicts — an autovacuum of the same
+   * partition, typically — this run skips the VACUUM rather than wait behind it, and the next one
+   * truncates. A failure is logged, not thrown: the chunks it would have pruned already moved and
+   * committed, and the compaction's other segments are still worth doing.
+   */
+  private void vacuum(String partition) {
+    try {
+      db.autocommit(
+          "Failed to vacuum " + partition,
+          connection -> {
+            try (Statement sql = connection.createStatement()) {
+              sql.execute("vacuum (truncate true, skip_locked true) " + partition);
+            }
+            return null;
+          });
+    } catch (RuntimeException e) {
+      LOG.warnf(e, "Could not vacuum %s this run; the next run truncates it", partition);
+    }
   }
 
   /** One partition of {@code blob_chunk}: its segment, its quoted name and its on-disk size. */
@@ -614,6 +869,44 @@ class BlobSegments {
    * @return the bytes moved, or -1 if the blob no longer owns its content
    */
   private long moveBatch(Owned blob, int segment, int from, int to) {
+    return moveChunks(
+        blob,
+        segment,
+        "seq >= ? and seq < ?",
+        (statement, index) -> {
+          statement.setInt(index, from);
+          statement.setInt(index + 1, to);
+        });
+  }
+
+  /**
+   * {@link #moveBatch}, for an explicit set of chunk numbers rather than a range — what the tail
+   * shrink moves: exactly the chunks whose bytes sit in the tail, and not the rest of their blob.
+   */
+  private long moveSeqs(Owned blob, int segment, List<Integer> seqs) {
+    return moveChunks(
+        blob,
+        segment,
+        "seq = any(?)",
+        (statement, index) ->
+            statement.setArray(
+                index, statement.getConnection().createArrayOf("int4", seqs.toArray())));
+  }
+
+  /** Binds the parameters of a {@link #moveChunks} chunk filter, starting at {@code index}. */
+  @FunctionalInterface
+  private interface SeqBinding {
+    void bind(PreparedStatement statement, int index) throws SQLException;
+  }
+
+  /**
+   * The one move both drains share: under the blob's advisory lock, and only while the blob still
+   * owns the content, copy the chunks {@code seqFilter} selects into the open segment and delete
+   * them from {@code segment}, in one transaction.
+   *
+   * @return the bytes moved, or -1 if the blob no longer owns its content
+   */
+  private long moveChunks(Owned blob, int segment, String seqFilter, SeqBinding seqs) {
     return db.inOwnTransaction(
         "Failed to move blob " + blob.blobId() + " out of segment " + segment,
         connection -> {
@@ -636,10 +929,13 @@ class BlobSegments {
                       + " insert into blob_chunk (content_id, seq, bytes, segment)"
                       + " select content_id, seq, bytes, (select segment from blob_segment)"
                       + " from blob_chunk"
-                      + " where content_id = ? and segment = ? and seq >= ? and seq < ?"
+                      + " where content_id = ? and segment = ? and "
+                      + seqFilter
                       + " returning octet_length(bytes) as length)"
                       + " select count(*), coalesce(sum(length), 0) from copied")) {
-            bindRange(copy, blob.contentId(), segment, from, to);
+            copy.setObject(1, blob.contentId());
+            copy.setInt(2, segment);
+            seqs.bind(copy, 3);
             try (ResultSet row = copy.executeQuery()) {
               row.next();
               rows = row.getLong(1);
@@ -648,9 +944,10 @@ class BlobSegments {
           }
           try (PreparedStatement delete =
               connection.prepareStatement(
-                  "delete from blob_chunk"
-                      + " where content_id = ? and segment = ? and seq >= ? and seq < ?")) {
-            bindRange(delete, blob.contentId(), segment, from, to);
+                  "delete from blob_chunk where content_id = ? and segment = ? and " + seqFilter)) {
+            delete.setObject(1, blob.contentId());
+            delete.setInt(2, segment);
+            seqs.bind(delete, 3);
             int deleted = delete.executeUpdate();
             if (deleted != rows) {
               // Cannot happen under the blob's lock; if it ever does, the rollback keeps every
@@ -661,15 +958,6 @@ class BlobSegments {
           }
           return bytes;
         });
-  }
-
-  private static void bindRange(
-      PreparedStatement statement, UUID contentId, int segment, int from, int to)
-      throws SQLException {
-    statement.setObject(1, contentId);
-    statement.setInt(2, segment);
-    statement.setInt(3, from);
-    statement.setInt(4, to);
   }
 
   /**
