@@ -148,13 +148,14 @@ class BlobSegments {
   double liveRatio;
 
   /**
-   * How far one compaction run shrinks oversized closed segments from their tail, in stored bytes
-   * of the live chunks it moves. An oversized segment is one past twice {@code segment-size} — in
-   * practice segment 0, the whole pre-qits-2248 table the upgrade attached.
+   * How far one compaction run shrinks oversized closed segments from their tail, in bytes of the
+   * TOAST relation where chunk bytes live. An oversized segment is one past twice {@code
+   * segment-size} — in practice segment 0, the whole pre-qits-2248 table the upgrade attached.
    *
-   * <p>The budget bounds what one run costs: at most this many bytes moved into the open segment
-   * (one chunk past it, for the chunk that crosses it) and so at most about this much free disk
-   * needed at once, before the truncation gives it back. See {@link #shrinkTail}.
+   * <p>The budget bounds what one run costs: at most this many bytes read in the tail, roughly this
+   * many moved into the open segment (one chunk past it, for a value straddling the tail's edge) and
+   * so roughly this much free disk needed at once, before the truncation gives it back. See {@link
+   * #shrinkTail}.
    */
   @ConfigProperty(name = "qits.artifacts.blobs.compaction.shrink-budget", defaultValue = "1073741824")
   long shrinkBudget;
@@ -446,12 +447,29 @@ class BlobSegments {
     long moved = 0;
     long truncated = 0;
     long shrinkLeft = shrinkBudget;
+    // Asked once per run, at the first oversized segment, and only then: see toastAccess.
+    ToastAccess toastAccess = null;
     for (Partition closed : closedPartitions(openAtStart)) {
       Live live = liveShare(closed.segment());
       boolean empty = live.rows() == 0;
       if (!empty && closed.diskBytes() > 2 * segmentSize) {
         // Oversized: never drained whole, whatever its live share — see shrinkTail.
         if (shrinkLeft <= 0) {
+          continue;
+        }
+        if (toastAccess == null) {
+          toastAccess = toastAccess();
+          if (!toastAccess.usage()) {
+            LOG.infof(
+                "Blob compaction: segment %d is oversized (%d bytes) but this role cannot read"
+                    + " pg_toast, so it is not shrunk; grant usage on schema pg_toast to %s in this"
+                    + " database",
+                closed.segment(),
+                closed.diskBytes(),
+                toastAccess.role());
+          }
+        }
+        if (!toastAccess.usage()) {
           continue;
         }
         Shrink shrink = shrinkTail(closed, shrinkLeft);
@@ -517,16 +535,17 @@ class BlobSegments {
   }
 
   /**
-   * What one tail shrink did: the budget its tail took — the stored size of the chunks it chose —
-   * the bytes it moved out of it, and the on-disk bytes the segment lost.
+   * What one tail shrink did: the tail it looked at, the bytes it moved out of it, and the on-disk
+   * bytes the segment lost.
    */
   private record Shrink(long windowBytes, long moved, long truncated) {}
 
-  /** The owned chunks of a partition's tail, by blob, and the stored bytes they hold in all. */
-  private record Tail(Map<Owned, List<Integer>> chunks, long bytes) {}
+  /** A partition's TOAST relation (a regclass-quoted name), its size in pages, the block size. */
+  record Toast(String name, long pages, long blockSize) {}
 
   /**
-   * Shrinks an oversized closed segment from its tail, by about {@code budget} bytes of chunks.
+   * Shrinks an oversized closed segment from the tail of its TOAST relation by at most {@code
+   * budget} bytes.
    *
    * <p><b>Why an oversized segment is not drained like the others.</b> Found live on qits-2248's
    * first day: the upgrade attached the whole pre-existing table as segment 0, 20 GB on disk and 92%
@@ -540,10 +559,12 @@ class BlobSegments {
    * its end.</b> So the shrink empties the end:
    *
    * <ol>
-   *   <li>The tail is the partition's owned chunks with the highest heap {@code ctid}, newest row
-   *       first, up to {@code budget} bytes of their stored size (and the one chunk that crosses it)
-   *       — see {@link #tailChunks}. Only chunks some blob owns qualify: STAGING content is never
-   *       moved.
+   *   <li>The tail is the last {@code budget} bytes of the partition's TOAST relation, from block
+   *       {@code N = max(0, pages - budget / block_size)} on.
+   *   <li>The live TOAST values there are read with a TID range scan ({@code ctid >= '(N,0)'}), which
+   *       reads those pages only, and mapped to their chunks through {@code
+   *       pg_column_toast_chunk_id} on the partition's heap — one small row per chunk, cheap to scan.
+   *       Only chunks some blob owns qualify: STAGING content is never moved.
    *   <li>Exactly those chunks — not the rest of their blob, which stays put until the tail reaches
    *       it — move into the open segment by the drain's own per-blob move, under the blob's lock,
    *       rolling it whenever it fills.
@@ -552,17 +573,20 @@ class BlobSegments {
    *       the heap), which returns them to the filesystem.
    * </ol>
    *
-   * <p><b>Why the heap's order stands for the TOAST relation's.</b> The bytes that take the disk are
-   * in the partition's TOAST relation, and its end is what the VACUUM has to empty — but that
-   * relation is in schema {@code pg_toast}, which grants a table's owner no USAGE: read directly, as
-   * the first cut of this shrink did, it failed live with {@code permission denied for schema
-   * pg_toast}, because a consumer's service role owns the blob tables and is not a superuser. The
-   * partition's own heap needs no such grant, and its order follows the TOAST relation's: a chunk's
-   * heap row and its TOAST value are written together, by the insert and equally by a {@code VACUUM
-   * FULL} or other rewrite, which re-toasts the values in heap order. So the newest heap rows hold
-   * the TOAST relation's tail. Where the two orders part — a TOAST tuple reusing a hole further down
-   * — the moved chunk's page stays and the truncation stops short of it; the truncation is measured
-   * after the move, so an imperfect correlation makes a run return less, never return wrong.
+   * <p><b>Why the tail is found by its exact TOAST position, and nothing cheaper.</b> The bytes that
+   * take the disk are in the TOAST relation, and only emptying its last pages lets the VACUUM cut
+   * anything off. A stand-in for that position was tried and failed live: choosing the newest heap
+   * rows by {@code ctid}, which needs no access to {@code pg_toast}, moved 1,074,593,353 bytes out
+   * of the 20 GB segment 0 in one run and truncated 770,048 — heap pages only — so every gc run
+   * <em>grew</em> the disk by about 1.1 GB. The heap's order does not follow the TOAST relation's
+   * there: new chunks reuse free slots low in the heap while their TOAST values append at the
+   * relation's end. Moving chunks that are not in the TOAST tail costs their full size and returns
+   * nothing, so the shrink reads the tail itself or does not run.
+   *
+   * <p><b>That needs USAGE on schema {@code pg_toast}</b>, which a table's owner is not granted.
+   * Compaction asks for it once per run ({@link #toastAccess}) and, without it, leaves every
+   * oversized segment as it is and logs the grant to make; the platform's deployer makes it for
+   * each service role in its own database.
    *
    * <p><b>What can make a run return less.</b> The truncation stops at the last live tuple, so a
    * STAGING upload in the tail holds the tail until it is promoted (the next run moves it) or
@@ -574,19 +598,20 @@ class BlobSegments {
    * own: VACUUM truncates only when at least 1000 pages (8 MB) or a sixteenth of the relation can
    * go, so a budget under 8 MiB on a large segment would move chunks and truncate nothing.
    *
-   * <p><b>What a run returns.</b> The budget is counted in live bytes, the ones that move; the dead
-   * space between them goes with them for free. So a run on a segment that is a share {@code s}
-   * live returns about {@code budget / s}, and moves about {@code budget}.
-   *
-   * <p><b>Cost.</b> Up to {@code budget} bytes moved (plus one chunk at the edge), a scan and sort
-   * of the partition's heap — one small row per chunk, about 20,000 for segment 0 on dev — and a
-   * VACUUM of the partition, which skips the pages its visibility map knows clean, but scans the
-   * TOAST relation's index whole when there is anything to remove from it.
+   * <p><b>Cost.</b> Up to {@code budget} bytes moved (plus one chunk at the edge), and a VACUUM of
+   * the partition — which skips the pages its visibility map knows clean, but scans the TOAST
+   * relation's index whole when there is anything to remove from it.
    */
   private Shrink shrinkTail(Partition partition, long budget) {
-    Tail tail = tailChunks(partition.name(), budget);
+    Toast toast = toastOf(partition.name());
+    if (toast == null || toast.pages() == 0) {
+      return new Shrink(0, 0, 0);
+    }
+    long startBlock = Math.max(0, toast.pages() - budget / toast.blockSize());
+    long windowBytes = (toast.pages() - startBlock) * toast.blockSize();
+    Map<Owned, List<Integer>> tail = tailChunks(partition.name(), toast.name(), startBlock);
     long moved = 0;
-    for (Map.Entry<Owned, List<Integer>> blob : tail.chunks().entrySet()) {
+    for (Map.Entry<Owned, List<Integer>> blob : tail.entrySet()) {
       List<Integer> seqs = blob.getValue();
       for (int from = 0; from < seqs.size(); from += DRAIN_BATCH) {
         long batch =
@@ -608,56 +633,128 @@ class BlobSegments {
     vacuum(partition.name());
     long truncated = Math.max(0, beforeVacuum - totalSize(partition.name()));
     LOG.debugf(
-        "Blob segment %d: tail of %d chunks of %d blobs (%d bytes stored), %d bytes moved, %d bytes"
-            + " truncated",
+        "Blob segment %d: tail from TOAST block %d of %d, %d chunks of %d blobs moved (%d bytes),"
+            + " %d bytes truncated",
         partition.segment(),
-        tail.chunks().values().stream().mapToInt(List::size).sum(),
-        tail.chunks().size(),
-        tail.bytes(),
+        startBlock,
+        toast.pages(),
+        tail.values().stream().mapToInt(List::size).sum(),
+        tail.size(),
         moved,
         truncated);
-    return new Shrink(tail.bytes(), moved, truncated);
+    return new Shrink(windowBytes, moved, truncated);
   }
 
   /**
-   * The statement that selects a partition's tail: its owned chunks by heap {@code ctid}, newest
-   * first, while the running sum of their stored size has not yet reached the budget — so the chunk
-   * that crosses it is in, and none after it. The partition name is the store's own, never input.
+   * Whether the role this store connects as may read {@code pg_toast}, and that role's name.
    *
-   * <p>{@code pg_column_size} of an out-of-line value is its stored size read from the TOAST pointer,
-   * so this scans and sorts the small heap and never fetches a byte of blob content — nor reads
-   * anything in {@code pg_toast}, which a non-superuser owner may not (see {@link #shrinkTail}).
+   * @param usage {@code has_schema_privilege('pg_toast', 'USAGE')} for the current user
+   * @param role {@code current_user}, for the log line that names the grant to make
    */
-  static String tailChunksSql(String partition) {
-    return "select content_id, id, seq, size from ("
-        + "select p.content_id, b.id, p.seq, pg_column_size(p.bytes)::bigint as size,"
-        + " sum(pg_column_size(p.bytes)::bigint) over (order by p.ctid desc"
-        + " rows between unbounded preceding and current row) as reached"
-        + " from "
-        + partition
-        + " p join blob b on b.content_id = p.content_id) tail"
-        + " where reached - size < ?"
-        + " order by content_id, seq";
+  private record ToastAccess(boolean usage, String role) {}
+
+  /**
+   * Asks the database whether the current role holds USAGE on schema {@code pg_toast} — the one
+   * privilege {@link #shrinkTail} needs beyond owning the blob tables.
+   *
+   * <p><b>Asked, never assumed or worked around.</b> A table's owner is granted no USAGE on {@code
+   * pg_toast}, so a consumer's service role — which owns the blob tables and is no superuser —
+   * cannot name its own partitions' TOAST relations without a grant: the first cut of the shrink
+   * failed live on exactly that, {@code permission denied for schema pg_toast}. The fallback that
+   * needed no grant, choosing the tail by heap order, then failed worse (see {@link #shrinkTail}).
+   * So without the privilege there is no safe shrink, and compaction skips oversized segments
+   * outright — moves nothing, vacuums nothing — and says, once per run, which grant to make.
+   *
+   * <p>The platform's deployer grants {@code USAGE ON SCHEMA pg_toast} to each service role in its
+   * own database. The grant is narrow: USAGE only lets the role <em>name</em> relations in the
+   * schema; every TOAST relation keeps the ACL of the table it belongs to, whose owner is its owner,
+   * so a role granted it can read the TOAST of its own tables and of nothing else.
+   */
+  private ToastAccess toastAccess() {
+    return db.autocommit(
+        "Failed to ask whether this role may read pg_toast",
+        connection -> {
+          try (Statement select = connection.createStatement();
+              ResultSet row =
+                  select.executeQuery(
+                      "select has_schema_privilege('pg_toast', 'USAGE'), current_user::text")) {
+            row.next();
+            return new ToastAccess(row.getBoolean(1), row.getString(2));
+          }
+        });
   }
 
-  /** The owned chunks of a partition's tail, by blob — see {@link #tailChunksSql}. */
-  private Tail tailChunks(String partition, long budget) {
+  /** The partition's TOAST relation and its size, or null if it has none. */
+  Toast toastOf(String partition) {
+    return db.autocommit(
+        "Failed to find the TOAST relation of " + partition,
+        connection -> {
+          try (PreparedStatement select =
+              connection.prepareStatement(
+                  "select t.oid::regclass::text,"
+                      + " pg_relation_size(t.oid) / current_setting('block_size')::bigint,"
+                      + " current_setting('block_size')::bigint"
+                      + " from pg_class c join pg_class t on t.oid = c.reltoastrelid"
+                      + " where c.oid = to_regclass(?)")) {
+            select.setString(1, partition);
+            try (ResultSet row = select.executeQuery()) {
+              return row.next() ? new Toast(row.getString(1), row.getLong(2), row.getLong(3)) : null;
+            }
+          }
+        });
+  }
+
+  /**
+   * The statement that lists the TOAST values with a tuple at or past {@code startBlock}: a TID
+   * range scan, which reads the tail pages and no others. A statement of its own, on purpose — folded
+   * into the chunk lookup as a subquery, the planner is free to probe the TOAST index once per heap
+   * row instead, which on segment 0 reads the whole relation the shrink exists to avoid. The name
+   * is regclass output, already quoted; the block is a number.
+   */
+  static String tailValuesSql(String toast, long startBlock) {
+    return "select distinct chunk_id::bigint from "
+        + toast
+        + " where ctid >= '("
+        + startBlock
+        + ",0)'::tid";
+  }
+
+  /**
+   * The owned chunks of a partition whose bytes live in its TOAST relation's tail, by blob. The
+   * value ids come from {@link #tailValuesSql}; mapping them back scans the partition's heap — one
+   * small row per chunk, with {@code pg_column_toast_chunk_id} reading only the TOAST pointer.
+   */
+  private Map<Owned, List<Integer>> tailChunks(String partition, String toast, long startBlock) {
     return db.autocommit(
         "Failed to read the tail of " + partition,
         connection -> {
+          List<Long> values = new ArrayList<>();
+          try (Statement select = connection.createStatement();
+              ResultSet rows = select.executeQuery(tailValuesSql(toast, startBlock))) {
+            while (rows.next()) {
+              values.add(rows.getLong(1));
+            }
+          }
           Map<Owned, List<Integer>> found = new LinkedHashMap<>();
-          long bytes = 0;
-          try (PreparedStatement select = connection.prepareStatement(tailChunksSql(partition))) {
-            select.setLong(1, budget);
+          if (values.isEmpty()) {
+            return found;
+          }
+          try (PreparedStatement select =
+              connection.prepareStatement(
+                  "select p.content_id, b.id, p.seq from "
+                      + partition
+                      + " p join blob b on b.content_id = p.content_id"
+                      + " where pg_column_toast_chunk_id(p.bytes)::bigint = any(?)"
+                      + " order by p.content_id, p.seq")) {
+            select.setArray(1, connection.createArrayOf("int8", values.toArray()));
             try (ResultSet rows = select.executeQuery()) {
               while (rows.next()) {
                 Owned owned = new Owned(rows.getObject(1, UUID.class), rows.getString(2));
                 found.computeIfAbsent(owned, key -> new ArrayList<>()).add(rows.getInt(3));
-                bytes += rows.getLong(4);
               }
             }
           }
-          return new Tail(found, bytes);
+          return found;
         });
   }
 
