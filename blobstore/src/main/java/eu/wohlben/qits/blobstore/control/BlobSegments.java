@@ -8,14 +8,18 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.SQLWarning;
 import java.sql.Statement;
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
@@ -540,8 +544,40 @@ class BlobSegments {
    */
   private record Shrink(long windowBytes, long moved, long truncated) {}
 
-  /** A partition's TOAST relation (a regclass-quoted name), its size in pages, the block size. */
-  record Toast(String name, long pages, long blockSize) {}
+  /**
+   * What one tail shrink found and did, kept around for {@link BlobShrinkTest} to inspect directly
+   * — the fields behind the INFO line {@link #shrinkTail} logs, without parsing it back out of
+   * text. Package-private for that one reason.
+   */
+  record ShrinkReport(
+      int segment,
+      long liveValues,
+      long ownedChunks,
+      long ownedBlobs,
+      long bytesMoved,
+      long notOwnedStaging,
+      long notOwnedOther,
+      long toastDeadTuples,
+      long toastLiveTuples,
+      long pagesBefore,
+      long pagesAfter,
+      long bytesTruncated,
+      String vacuumSummary) {
+    long notOwned() {
+      return notOwnedStaging + notOwnedOther;
+    }
+  }
+
+  /** The most recent {@link #shrinkTail} call's report, for {@link BlobShrinkTest} alone. */
+  private volatile ShrinkReport lastShrinkReport;
+
+  /** Package-private accessor for {@link BlobShrinkTest}; nothing else needs the raw numbers. */
+  ShrinkReport lastShrinkReport() {
+    return lastShrinkReport;
+  }
+
+  /** A partition's TOAST relation (a regclass-quoted name), its oid, its size in pages, the block size. */
+  record Toast(String name, long oid, long pages, long blockSize) {}
 
   /**
    * Shrinks an oversized closed segment from the tail of its TOAST relation by at most {@code
@@ -609,9 +645,9 @@ class BlobSegments {
     }
     long startBlock = Math.max(0, toast.pages() - budget / toast.blockSize());
     long windowBytes = (toast.pages() - startBlock) * toast.blockSize();
-    Map<Owned, List<Integer>> tail = tailChunks(partition.name(), toast.name(), startBlock);
+    TailSummary tail = tailSummary(partition.name(), toast.name(), startBlock);
     long moved = 0;
-    for (Map.Entry<Owned, List<Integer>> blob : tail.entrySet()) {
+    for (Map.Entry<Owned, List<Integer>> blob : tail.owned().entrySet()) {
       List<Integer> seqs = blob.getValue();
       for (int from = 0; from < seqs.size(); from += DRAIN_BATCH) {
         long batch =
@@ -629,20 +665,68 @@ class BlobSegments {
       // itself, and shrunk again by a later run, moving the same chunks twice.
       rollIfFull();
     }
+    // Read before the VACUUM below, so the dead/live counts and the timestamps describe what this
+    // run found on arrival — autovacuum's own account, not anything our VACUUM is about to produce.
+    ToastStats stats = toastStats(toast.oid());
     long beforeVacuum = totalSize(partition.name());
-    vacuum(partition.name());
+    List<String> vacuumMessages = vacuum(partition.name());
     long truncated = Math.max(0, beforeVacuum - totalSize(partition.name()));
-    LOG.debugf(
-        "Blob segment %d: tail from TOAST block %d of %d, %d chunks of %d blobs moved (%d bytes),"
-            + " %d bytes truncated",
+    Toast toastAfter = toastOf(partition.name());
+    long pagesAfter = toastAfter == null ? 0 : toastAfter.pages();
+    long ownedChunks = tail.ownedChunks();
+    long ownedBlobs = tail.ownedBlobs();
+    String vacuumSummary = condenseVacuumMessages(vacuumMessages);
+    lastShrinkReport =
+        new ShrinkReport(
+            partition.segment(),
+            tail.liveValues(),
+            ownedChunks,
+            ownedBlobs,
+            moved,
+            tail.notOwnedStaging(),
+            tail.notOwnedOther(),
+            stats.deadTuples(),
+            stats.liveTuples(),
+            toast.pages(),
+            pagesAfter,
+            truncated,
+            vacuumSummary);
+    // The four live causes a flat "0 bytes truncated" cannot tell apart on its own: (a) VACUUM
+    // skipped a conflicting lock (the vacuum part names it), (b) VACUUM ran but could not get the
+    // brief ACCESS EXCLUSIVE lock to truncate (same), (c) dead tuples an old snapshot still pins
+    // (the dead/live tuple counts and the last-vacuum timestamps), (d) live tail content with no
+    // owning blob — STAGING or otherwise — holding the truncation back below it (not owned > 0).
+    LOG.infof(
+        "Blob segment %d: tail from TOAST block %d of %d (window %d bytes): %d live values, %d"
+            + " owned (%d chunks of %d blobs moved, %d bytes), %d not owned (%d staging, %d other);"
+            + " toast dead/live tuples %d/%d, last autovacuum %s, last vacuum %s; pages %d -> %d,"
+            + " truncated %d bytes; vacuum: %s",
         partition.segment(),
         startBlock,
         toast.pages(),
-        tail.values().stream().mapToInt(List::size).sum(),
-        tail.size(),
+        windowBytes,
+        tail.liveValues(),
+        ownedChunks,
+        ownedChunks,
+        ownedBlobs,
         moved,
-        truncated);
+        tail.notOwnedStaging() + tail.notOwnedOther(),
+        tail.notOwnedStaging(),
+        tail.notOwnedOther(),
+        stats.deadTuples(),
+        stats.liveTuples(),
+        formatStatsTimestamp(stats.lastAutovacuum()),
+        formatStatsTimestamp(stats.lastVacuum()),
+        toast.pages(),
+        pagesAfter,
+        truncated,
+        vacuumSummary);
     return new Shrink(windowBytes, moved, truncated);
+  }
+
+  /** {@code pg_stat_all_tables}'s timestamp columns are null until the first vacuum ever runs. */
+  private static String formatStatsTimestamp(OffsetDateTime at) {
+    return at == null ? "never" : at.toString();
   }
 
   /**
@@ -691,14 +775,53 @@ class BlobSegments {
         connection -> {
           try (PreparedStatement select =
               connection.prepareStatement(
-                  "select t.oid::regclass::text,"
+                  "select t.oid::regclass::text, t.oid::bigint,"
                       + " pg_relation_size(t.oid) / current_setting('block_size')::bigint,"
                       + " current_setting('block_size')::bigint"
                       + " from pg_class c join pg_class t on t.oid = c.reltoastrelid"
                       + " where c.oid = to_regclass(?)")) {
             select.setString(1, partition);
             try (ResultSet row = select.executeQuery()) {
-              return row.next() ? new Toast(row.getString(1), row.getLong(2), row.getLong(3)) : null;
+              return row.next()
+                  ? new Toast(row.getString(1), row.getLong(2), row.getLong(3), row.getLong(4))
+                  : null;
+            }
+          }
+        });
+  }
+
+  /** The TOAST relation's own stat-view counters: dead/live tuples, and when it was last vacuumed. */
+  private record ToastStats(
+      long deadTuples, long liveTuples, OffsetDateTime lastAutovacuum, OffsetDateTime lastVacuum) {}
+
+  /**
+   * Reads {@code pg_stat_all_tables} for one TOAST relation by its oid. Unlike the relation's own
+   * rows, its stats need no {@link #toastAccess} grant — the view is readable for any table a role
+   * can see at all, which the role's ownership of the partition already gives it.
+   *
+   * <p>Read once per shrink, right before the VACUUM {@link #shrinkTail} is about to issue, so the
+   * counts and timestamps describe what autovacuum (or the previous run) left behind — telling a
+   * tail that is genuinely clean apart from one that is not, both of which VACUUM alone, run again,
+   * cannot distinguish on its own.
+   */
+  private ToastStats toastStats(long oid) {
+    return db.autocommit(
+        "Failed to read TOAST stats for relation " + oid,
+        connection -> {
+          try (PreparedStatement select =
+              connection.prepareStatement(
+                  "select n_dead_tup, n_live_tup, last_autovacuum, last_vacuum"
+                      + " from pg_stat_all_tables where relid = ?")) {
+            select.setLong(1, oid);
+            try (ResultSet row = select.executeQuery()) {
+              if (!row.next()) {
+                return new ToastStats(0, 0, null, null);
+              }
+              return new ToastStats(
+                  row.getLong(1),
+                  row.getLong(2),
+                  row.getObject(3, OffsetDateTime.class),
+                  row.getObject(4, OffsetDateTime.class));
             }
           }
         });
@@ -720,11 +843,31 @@ class BlobSegments {
   }
 
   /**
-   * The owned chunks of a partition whose bytes live in its TOAST relation's tail, by blob. The
-   * value ids come from {@link #tailValuesSql}; mapping them back scans the partition's heap — one
-   * small row per chunk, with {@code pg_column_toast_chunk_id} reading only the TOAST pointer.
+   * What the tail scan of one partition found: how many live TOAST values sit in the window
+   * ({@link #tailValuesSql}), the owned chunks among them by blob, and how many are not owned at
+   * all — split into STAGING (an upload still being written, never moved) and other (promoted
+   * content with no blob row, which {@link #drain} already treats as not this run's either).
    */
-  private Map<Owned, List<Integer>> tailChunks(String partition, String toast, long startBlock) {
+  private record TailSummary(
+      long liveValues, Map<Owned, List<Integer>> owned, long notOwnedStaging, long notOwnedOther) {
+    long ownedChunks() {
+      return owned.values().stream().mapToInt(List::size).sum();
+    }
+
+    long ownedBlobs() {
+      return owned.size();
+    }
+  }
+
+  /**
+   * The tail's live TOAST values, by whether a blob owns the chunk they belong to. One heap scan
+   * answers both the owned mapping and the not-owned split, instead of two: the value ids come from
+   * {@link #tailValuesSql}; matching them back scans the partition's heap once — one small row per
+   * chunk, with {@code pg_column_toast_chunk_id} reading only the TOAST pointer — and the not-owned
+   * count is exactly what tells a tail still held by STAGING (or other unowned) content apart from
+   * one VACUUM simply could not truncate, the two causes a bare byte count cannot distinguish.
+   */
+  private TailSummary tailSummary(String partition, String toast, long startBlock) {
     return db.autocommit(
         "Failed to read the tail of " + partition,
         connection -> {
@@ -735,26 +878,35 @@ class BlobSegments {
               values.add(rows.getLong(1));
             }
           }
-          Map<Owned, List<Integer>> found = new LinkedHashMap<>();
-          if (values.isEmpty()) {
-            return found;
-          }
-          try (PreparedStatement select =
-              connection.prepareStatement(
-                  "select p.content_id, b.id, p.seq from "
-                      + partition
-                      + " p join blob b on b.content_id = p.content_id"
-                      + " where pg_column_toast_chunk_id(p.bytes)::bigint = any(?)"
-                      + " order by p.content_id, p.seq")) {
-            select.setArray(1, connection.createArrayOf("int8", values.toArray()));
-            try (ResultSet rows = select.executeQuery()) {
-              while (rows.next()) {
-                Owned owned = new Owned(rows.getObject(1, UUID.class), rows.getString(2));
-                found.computeIfAbsent(owned, key -> new ArrayList<>()).add(rows.getInt(3));
+          Map<Owned, List<Integer>> owned = new LinkedHashMap<>();
+          long staging = 0;
+          long other = 0;
+          if (!values.isEmpty()) {
+            try (PreparedStatement select =
+                connection.prepareStatement(
+                    "select p.content_id, b.id, c.state, p.seq from "
+                        + partition
+                        + " p join blob_content c on c.content_id = p.content_id"
+                        + " left join blob b on b.content_id = p.content_id"
+                        + " where pg_column_toast_chunk_id(p.bytes)::bigint = any(?)"
+                        + " order by p.content_id, p.seq")) {
+              select.setArray(1, connection.createArrayOf("int8", values.toArray()));
+              try (ResultSet rows = select.executeQuery()) {
+                while (rows.next()) {
+                  String blobId = rows.getString(2);
+                  if (blobId != null) {
+                    Owned key = new Owned(rows.getObject(1, UUID.class), blobId);
+                    owned.computeIfAbsent(key, k -> new ArrayList<>()).add(rows.getInt(4));
+                  } else if ("STAGING".equals(rows.getString(3))) {
+                    staging++;
+                  } else {
+                    other++;
+                  }
+                }
               }
             }
           }
-          return found;
+          return new TailSummary(values.size(), owned, staging, other);
         });
   }
 
@@ -775,28 +927,76 @@ class BlobSegments {
   }
 
   /**
-   * A plain VACUUM of one partition, with truncation asked for explicitly so a {@code
-   * vacuum_truncate = off} reloption cannot quietly turn the shrink into a no-op. Never inside a
-   * transaction — VACUUM refuses one — which the autocommit connection guarantees.
+   * A VACUUM of one partition, with truncation asked for explicitly so a {@code vacuum_truncate =
+   * off} reloption cannot quietly turn the shrink into a no-op. Never inside a transaction — VACUUM
+   * refuses one — which the autocommit connection guarantees.
    *
    * <p>{@code SKIP_LOCKED}: if anything holds a lock that conflicts — an autovacuum of the same
    * partition, typically — this run skips the VACUUM rather than wait behind it, and the next one
    * truncates. A failure is logged, not thrown: the chunks it would have pruned already moved and
    * committed, and the compaction's other segments are still worth doing.
+   *
+   * <p>{@code VERBOSE true}: PostgreSQL reports VACUUM's own account of what it did — truncated
+   * page counts, dead/removable tuple counts, the removable cutoff, a skipped lock — as INFO-level
+   * server messages on the statement, not as anything a {@code RETURNING} clause or a result set
+   * could carry. pgjdbc surfaces every NOTICE, INFO and WARNING severity as a chained {@link
+   * SQLWarning} on the {@link Statement} that ran it ({@code Statement.getWarnings()}, followed by
+   * {@code getNextWarning()}); {@link BlobShrinkTest} asserts that chain is not empty, so a pgjdbc
+   * upgrade that stopped surfacing INFO would fail a test rather than go quietly unnoticed in a
+   * log line nobody reads until the next live incident.
+   *
+   * @return the server's messages for this statement, oldest first, for {@link #shrinkTail} to fold
+   *     into its one INFO line
    */
-  private void vacuum(String partition) {
+  private List<String> vacuum(String partition) {
     try {
-      db.autocommit(
+      return db.autocommit(
           "Failed to vacuum " + partition,
           connection -> {
             try (Statement sql = connection.createStatement()) {
-              sql.execute("vacuum (truncate true, skip_locked true) " + partition);
+              sql.execute("vacuum (verbose true, truncate true, skip_locked true) " + partition);
+              List<String> messages = new ArrayList<>();
+              for (SQLWarning warning = sql.getWarnings();
+                  warning != null;
+                  warning = warning.getNextWarning()) {
+                messages.add(warning.getMessage());
+              }
+              return messages;
             }
-            return null;
           });
     } catch (RuntimeException e) {
       LOG.warnf(e, "Could not vacuum %s this run; the next run truncates it", partition);
+      return List.of();
     }
+  }
+
+  /**
+   * The VERBOSE lines worth keeping in one INFO line. VACUUM VERBOSE's full account runs to dozens
+   * of lines — per-index statistics, buffer counts, the oldest xmin it found — most of which repeat
+   * the same shape every run and answer nothing {@link #shrinkTail}'s log needs. These keywords are
+   * the ones that do: whether it truncated pages, skipped a lock, found tuples removable or dead,
+   * or named the removable cutoff.
+   */
+  private static final Pattern VACUUM_KEEP =
+      Pattern.compile("(?i)truncat|skipping|removable|dead|cutoff|lock");
+
+  /** How long {@link #condenseVacuumMessages} lets its join run before cutting it off. */
+  private static final int VACUUM_SUMMARY_CAP = 1500;
+
+  /**
+   * Splits every VACUUM message into lines, keeps the ones {@link #VACUUM_KEEP} matches, and joins
+   * them with {@code " | "} — capped so one segment's worth of VERBOSE output never dwarfs the rest
+   * of the log line it is folded into.
+   */
+  private static String condenseVacuumMessages(List<String> messages) {
+    String joined =
+        messages.stream()
+            .flatMap(message -> Arrays.stream(message.split("\\r?\\n")))
+            .map(String::trim)
+            .filter(line -> !line.isEmpty())
+            .filter(line -> VACUUM_KEEP.matcher(line).find())
+            .collect(Collectors.joining(" | "));
+    return joined.length() > VACUUM_SUMMARY_CAP ? joined.substring(0, VACUUM_SUMMARY_CAP) : joined;
   }
 
   /** One partition of {@code blob_chunk}: its segment, its quoted name and its on-disk size. */
