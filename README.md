@@ -105,12 +105,23 @@ under half live would also have needed half of it free at once for the drain. So
 from the tail instead, by at most `qits.artifacts.blobs.compaction.shrink-budget` (1 GiB): the owned
 chunks whose bytes sit in the last budget's worth of its TOAST relation (found with a TID range scan,
 mapped through `pg_column_toast_chunk_id`, PostgreSQL 17+) move into the open segment, and a
-`VACUUM (TRUNCATE true, SKIP_LOCKED true)` of the partition cuts the emptied pages off its end. The disk comes back a
-budget per gc run, at the price of moving about that much; once the segment is down to twice the
-segment size the ratio rule takes it over. A STAGING upload in the tail, a long-running transaction
-elsewhere (whose snapshot keeps the moved chunks' old copies alive) or a truncation lock VACUUM could
-not get only delays the return to a later run. `CompactionResult` reports it as `segmentsShrunk` and
-`bytesTruncated`.
+`VACUUM (INDEX_CLEANUP ON, TRUNCATE true, SKIP_LOCKED true)` of the partition cuts the emptied pages
+off its end. The disk comes back a budget per gc run, at the price of moving about that much; once
+the segment is down to twice the segment size the ratio rule takes it over. A STAGING upload in the
+tail, a long-running transaction elsewhere (whose snapshot keeps the moved chunks' old copies alive)
+or a truncation lock VACUUM could not get only delays the return to a later run. `CompactionResult`
+reports it as `segmentsShrunk` and `bytesTruncated`.
+
+`INDEX_CLEANUP` is forced `ON`, not left at its `AUTO` default: found live on segment 0, a tail the
+shrink had just emptied of live TOAST values still truncated nothing — `0 live values, ... toast
+dead/live tuples 0/4663910 ...; truncated 0 bytes; vacuum: ... index scan bypassed: 23352 pages from
+table (0.98% of total) have 93333 dead item identifiers`. Fewer than `BYPASS_THRESHOLD_PAGES` (2% of
+the relation's pages) carried an `LP_DEAD` line pointer, so `AUTO` skipped index vacuuming; the
+skipped pointers were never turned `LP_UNUSED`, and truncation treats any page with a used line
+pointer, dead or live, as nondeletable, so the emptied tail — about the 186 MB a previous run had
+moved out of it — stayed on disk. Forcing `INDEX_CLEANUP ON` retires those pointers so the genuinely
+empty tail truncates; the cost is a full scan of the TOAST relation's index on every shrink that has
+anything to remove, paid once per gc run.
 
 The shrink needs the exact TOAST position — a stand-in failed live: choosing the newest heap rows,
 which needs no access to `pg_toast`, moved 1.07 GB out of segment 0 per run and truncated 770 kB, so

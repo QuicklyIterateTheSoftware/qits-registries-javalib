@@ -341,4 +341,44 @@ class BlobShrinkTest extends SegmentTestSupport {
       }
     }
   }
+
+  /**
+   * qits-2248, found live: VACUUM's {@code INDEX_CLEANUP AUTO} default bypasses index vacuuming
+   * whenever fewer than {@code BYPASS_THRESHOLD_PAGES} (2% of the relation's pages) carry an {@code
+   * LP_DEAD} line pointer — on segment 0 a tail the shrink had just emptied of every live TOAST
+   * value still truncated nothing, because the bypassed pointers stayed and truncation will not cut
+   * a page that still holds one. Forcing {@code INDEX_CLEANUP ON} is the fix; see {@link
+   * BlobSegments#vacuumSql} and {@code shrinkTail}'s javadoc for the live numbers.
+   *
+   * <p>A genuine bypass needs PostgreSQL's own thresholds to line up: the 2% bypass trigger is a
+   * share of the <em>whole</em> relation's pages, not of the window being vacuumed, so the relation
+   * has to outweigh one shrink budget by about 1/0.02 = 50x before a budget's worth of freshly-dead
+   * pages can still read as under 2%. At this profile's 8 MiB budget that is a relation of at least
+   * ~400 MiB — a hundred times {@link ShrinkProfile}'s 4 MiB segment and ten times the 40 MiB this
+   * suite's biggest fixture stages today — well past what a unit test should insert and VACUUM just
+   * to exercise one branch. So no such case is added here; what a unit test can prove instead is
+   * the statement itself forces the option, and that an ordinary shrink's VACUUM VERBOSE account
+   * never says "bypassed".
+   */
+  @Test
+  void theVacuumForcesIndexCleanupOnSoABypassCannotLeaveLinePointersBehind() throws Exception {
+    assertTrue(
+        BlobSegments.vacuumSql("blob_chunk_0").toLowerCase().contains("index_cleanup on"),
+        "the shrink's VACUUM must force index cleanup on, not leave it at AUTO's default");
+
+    Big big = bigSegment(70_000, Set.of());
+    for (int i = 0; i < BLOBS; i++) {
+      if (i % 3 == 1) {
+        reclaim(big.blobs().get(i).sha256());
+      }
+    }
+
+    compaction.compact();
+
+    ShrinkReport report = segments.lastShrinkReport();
+    assertNotNull(report, "a shrink must leave a report behind");
+    assertFalse(
+        report.vacuumSummary().toLowerCase().contains("bypassed"),
+        "index cleanup forced on must never let VACUUM bypass index vacuuming: " + report);
+  }
 }
