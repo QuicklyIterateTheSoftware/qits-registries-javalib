@@ -604,10 +604,28 @@ class BlobSegments {
    *   <li>Exactly those chunks — not the rest of their blob, which stays put until the tail reaches
    *       it — move into the open segment by the drain's own per-blob move, under the blob's lock,
    *       rolling it whenever it fills.
-   *   <li>A plain {@code VACUUM (TRUNCATE true, SKIP_LOCKED true)} on the partition prunes the moved
-   *       and deleted tuples and cuts the now-empty pages off the end of the TOAST relation (and
-   *       the heap), which returns them to the filesystem.
+   *   <li>{@code VACUUM (INDEX_CLEANUP ON, TRUNCATE true, SKIP_LOCKED true)} on the partition prunes
+   *       the moved and deleted tuples and cuts the now-empty pages off the end of the TOAST relation
+   *       (and the heap), which returns them to the filesystem.
    * </ol>
+   *
+   * <p><b>Why {@code INDEX_CLEANUP} is forced {@code ON}.</b> Found live on the 20 GB segment 0,
+   * after a shrink had already moved the tail's chunks out: {@code tail from TOAST block 2263563 of
+   * 2394635 (window 1073741824 bytes): 0 live values, ... toast dead/live tuples 0/4663910 ...; pages
+   * 2394635 -&gt; 2394635, truncated 0 bytes; vacuum: ... index scan bypassed: 23352 pages from table
+   * (0.98% of total) have 93333 dead item identifiers}. The tail held no live tuples at all — the
+   * values were gone — yet nothing truncated. With {@code INDEX_CLEANUP AUTO} (the default), VACUUM
+   * skips index vacuuming whenever fewer than {@code BYPASS_THRESHOLD_PAGES} — 2% of the relation's
+   * pages — carry an {@code LP_DEAD} line pointer; here only 0.98% did, so it bypassed. A bypassed
+   * page's {@code LP_DEAD} pointers are never turned into {@code LP_UNUSED}, and truncation treats
+   * any page with a used line pointer, dead or live, as nondeletable — so the pages the tail had just
+   * emptied of values still counted as occupied, and truncation, which only ever cuts a contiguous
+   * run of fully-unused pages off the end, cut nothing. 23352 pages is about the 186 MB a previous
+   * run moved out of this same tail: the move did its job, and only the bypassed index cleanup kept
+   * the pages from being given back. {@code INDEX_CLEANUP ON} disables the bypass, so those line
+   * pointers are retired and the truly empty tail truncates on the run that emptied it, at the cost
+   * of a full scan of the TOAST relation's index on every shrink that has anything to remove — paid
+   * once per gc run, which is cheap enough to always pay.
    *
    * <p><b>Why the tail is found by its exact TOAST position, and nothing cheaper.</b> The bytes that
    * take the disk are in the TOAST relation, and only emptying its last pages lets the VACUUM cut
@@ -635,8 +653,9 @@ class BlobSegments {
    * go, so a budget under 8 MiB on a large segment would move chunks and truncate nothing.
    *
    * <p><b>Cost.</b> Up to {@code budget} bytes moved (plus one chunk at the edge), and a VACUUM of
-   * the partition — which skips the pages its visibility map knows clean, but scans the TOAST
-   * relation's index whole when there is anything to remove from it.
+   * the partition — which skips the pages its visibility map knows clean, but, with the bypass
+   * forced off, scans the TOAST relation's index whole on every run that has anything to remove
+   * from it.
    */
   private Shrink shrinkTail(Partition partition, long budget) {
     Toast toast = toastOf(partition.name());
@@ -931,6 +950,13 @@ class BlobSegments {
    * off} reloption cannot quietly turn the shrink into a no-op. Never inside a transaction — VACUUM
    * refuses one — which the autocommit connection guarantees.
    *
+   * <p>{@code INDEX_CLEANUP ON}: also asked for explicitly, not left at the {@code AUTO} default.
+   * Found live on segment 0: a tail the shrink had just emptied of live values still truncated
+   * nothing, because {@code AUTO} let PostgreSQL's own bypass optimisation skip index vacuuming —
+   * see {@link #shrinkTail} for the INFO line that caught it and the mechanism. Forcing it on costs
+   * a full scan of the TOAST relation's index on a run that has anything to remove, which is the
+   * price of a truncation that actually happens.
+   *
    * <p>{@code SKIP_LOCKED}: if anything holds a lock that conflicts — an autovacuum of the same
    * partition, typically — this run skips the VACUUM rather than wait behind it, and the next one
    * truncates. A failure is logged, not thrown: the chunks it would have pruned already moved and
@@ -954,7 +980,7 @@ class BlobSegments {
           "Failed to vacuum " + partition,
           connection -> {
             try (Statement sql = connection.createStatement()) {
-              sql.execute("vacuum (verbose true, truncate true, skip_locked true) " + partition);
+              sql.execute(vacuumSql(partition));
               List<String> messages = new ArrayList<>();
               for (SQLWarning warning = sql.getWarnings();
                   warning != null;
@@ -968,6 +994,16 @@ class BlobSegments {
       LOG.warnf(e, "Could not vacuum %s this run; the next run truncates it", partition);
       return List.of();
     }
+  }
+
+  /**
+   * The exact statement {@link #vacuum} runs, pulled out so {@link BlobShrinkTest} can assert on
+   * the SQL text itself — in particular that {@code INDEX_CLEANUP} is forced {@code ON} — rather
+   * than re-deriving it, since a real bypass only reproduces on a relation far larger than the
+   * suite can afford (see the test for why).
+   */
+  static String vacuumSql(String partition) {
+    return "vacuum (verbose true, index_cleanup on, truncate true, skip_locked true) " + partition;
   }
 
   /**
