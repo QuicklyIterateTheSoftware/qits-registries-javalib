@@ -10,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import eu.wohlben.qits.blobstore.control.BlobCompaction.CompactionResult;
+import eu.wohlben.qits.blobstore.control.BlobSegments.ShrinkReport;
 import eu.wohlben.qits.blobstore.testdb.BlobTables;
 import eu.wohlben.qits.blobstore.testdb.EmbeddedPg;
 import io.quarkus.test.junit.QuarkusTest;
@@ -144,6 +145,20 @@ class BlobShrinkTest extends SegmentTestSupport {
         "only the tail's live chunks move: " + result);
     assertTrue(result.blobTablesBytesAfter() < result.blobTablesBytesBefore(), result.toString());
 
+    // qits-2248: the one INFO line a shrink reports must carry VACUUM VERBOSE's own account of
+    // what it did — the only way to tell "VACUUM truncated" apart from "VACUUM skipped a lock" or
+    // "nothing was removable yet" live, since a plain byte count cannot.
+    ShrinkReport report = segments.lastShrinkReport();
+    assertNotNull(report, "a shrink must leave a report behind");
+    assertEquals(big.segment(), report.segment());
+    assertTrue(
+        report.vacuumSummary() != null && !report.vacuumSummary().isBlank(),
+        "the vacuum part of the report must not be empty: " + report);
+    assertTrue(
+        report.vacuumSummary().toLowerCase().contains("truncat"),
+        "a run that truncated pages must say so: " + report);
+    assertEquals(0, report.notOwnedStaging(), "nothing staged is in this test's tail");
+
     String last = big.blobs().get(BLOBS - 1).sha256();
     String first = big.blobs().get(0).sha256();
     assertNotEquals(big.segment(), segmentOfBlob(last), "the tail's blobs moved out");
@@ -234,6 +249,13 @@ class BlobShrinkTest extends SegmentTestSupport {
     assertTrue(
         cut > 0 && cut < BUDGET - CHUNK,
         "truncated down to the upload's bytes and no further: " + cut + ", " + result);
+
+    // qits-2248: cause (d) — live tail content with no owning blob — must show up in the report as
+    // a non-zero "not owned", split out as STAGING, so a live run can tell this apart from (a)-(c).
+    ShrinkReport report = segments.lastShrinkReport();
+    assertNotNull(report, "a shrink must leave a report behind");
+    assertTrue(report.notOwnedStaging() > 0, "the staging upload's chunks must count as not owned: " + report);
+    assertEquals(0, report.notOwnedOther(), report.toString());
 
     // Promoted, it is ordinary content: the next run moves it and the tail goes on shrinking.
     assertFalse(blobStore.promote(upload));
